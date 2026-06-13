@@ -1,0 +1,15 @@
+build/
+build-release/
+build-exp-rel/
+build-release-noisal/
+dist/
+deploy/
+publish/
+package/
+tmp/
+apps/gui/bin/
+apps/gui/obj/
+
+CMakeUserPresets.json
+build_latest.log
+build_submodule_check.log

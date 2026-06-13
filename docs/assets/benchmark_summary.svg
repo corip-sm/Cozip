@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="760" viewBox="0 0 1080 760" role="img" aria-labelledby="title desc">
+  <title id="title">Cozip Benchmark Summary</title>
+  <desc id="desc">Sequential local benchmark summary comparing Cozip and Bandizip on 1GB, 10GB, and 40GB ZIP workloads.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f6fbff"/>
+      <stop offset="100%" stop-color="#eef5f0"/>
+    </linearGradient>
+    <style>
+      .title { font: 700 34px 'Segoe UI', sans-serif; fill: #102030; }
+      .subtitle { font: 400 16px 'Segoe UI', sans-serif; fill: #4b6171; }
+      .card { fill: #ffffff; stroke: #d8e2e8; stroke-width: 1; }
+      .section { font: 700 20px 'Segoe UI', sans-serif; fill: #173042; }
+      .label { font: 600 14px 'Segoe UI', sans-serif; fill: #29485b; }
+      .value { font: 700 13px 'Segoe UI', sans-serif; fill: #102030; }
+      .note { font: 400 13px 'Segoe UI', sans-serif; fill: #5d7280; }
+      .cozip { fill: #0f9d58; }
+      .bandi { fill: #ff8a3d; }
+      .grid { stroke: #edf2f5; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="1080" height="760" fill="url(#bg)"/>
+  <text x="60" y="70" class="title">Cozip Benchmark Summary</text>
+  <text x="60" y="102" class="subtitle">Release · sequential local runs · ZIP compatibility maintained</text>
+
+  <g transform="translate(60,140)">
+    <rect class="card" rx="18" ry="18" width="960" height="170"/>
+    <text x="28" y="38" class="section">1GB</text>
+    <text x="28" y="62" class="note">3-run average</text>
+    <line x1="28" y1="86" x2="932" y2="86" class="grid"/>
+
+    <text x="28" y="118" class="label">Compress</text>
+    <rect x="140" y="103" width="250" height="18" rx="9" class="cozip"/>
+    <rect x="140" y="133" width="500" height="18" rx="9" class="bandi"/>
+    <text x="402" y="117" class="value">Cozip 0.895s</text>
+    <text x="652" y="147" class="value">Bandizip 1.794s</text>
+
+    <text x="28" y="156" class="label">Extract</text>
+    <rect x="140" y="141" width="419" height="18" rx="9" class="cozip"/>
+    <rect x="140" y="171" width="500" height="18" rx="9" class="bandi" transform="translate(0,-20)"/>
+    <text x="571" y="155" class="value">Cozip 0.476s</text>
+    <text x="652" y="185" class="value" transform="translate(0,-20)">Bandizip 0.568s</text>
+  </g>
+
+  <g transform="translate(60,340)">
+    <rect class="card" rx="18" ry="18" width="960" height="170"/>
+    <text x="28" y="38" class="section">10GB</text>
+    <text x="28" y="62" class="note">3-run average</text>
+    <line x1="28" y1="86" x2="932" y2="86" class="grid"/>
+
+    <text x="28" y="118" class="label">Compress</text>
+    <rect x="140" y="103" width="294" height="18" rx="9" class="cozip"/>
+    <rect x="140" y="133" width="500" height="18" rx="9" class="bandi"/>
+    <text x="446" y="117" class="value">Cozip 11.072s</text>
+    <text x="652" y="147" class="value">Bandizip 18.822s</text>
+
+    <text x="28" y="156" class="label">Extract</text>
+    <rect x="140" y="141" width="320" height="18" rx="9" class="cozip"/>
+    <rect x="140" y="171" width="500" height="18" rx="9" class="bandi" transform="translate(0,-20)"/>
+    <text x="472" y="155" class="value">Cozip 6.927s</text>
+    <text x="652" y="185" class="value" transform="translate(0,-20)">Bandizip 10.821s</text>
+  </g>
+
+  <g transform="translate(60,540)">
+    <rect class="card" rx="18" ry="18" width="960" height="150"/>
+    <text x="28" y="38" class="section">40GB</text>
+    <text x="28" y="62" class="note">1-run snapshot</text>
+    <line x1="28" y1="86" x2="932" y2="86" class="grid"/>
+
+    <text x="28" y="118" class="label">Compress / Extract</text>
+    <text x="240" y="118" class="value">Cozip 80.292s / 54.366s</text>
+    <text x="560" y="118" class="value">Bandizip 85.680s / 76.362s</text>
+  </g>
+</svg>
