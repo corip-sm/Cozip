@@ -4,7 +4,8 @@
 
 namespace cozip::format_zip
 {
-constexpr std::size_t kRandomAccessStreamBufferBytes = 8u * 1024u * 1024u;
+constexpr std::size_t kRandomAccessWriterStreamBufferBytes = 32u * 1024u * 1024u;
+constexpr std::size_t kRandomAccessReaderStreamBufferBytes = 16u * 1024u * 1024u;
 
 class RandomAccessWriterStreamBuf final : public std::streambuf
 {
@@ -149,7 +150,7 @@ private:
     }
 
     storage::IRandomAccessWriter& writer_;
-    std::vector<char> buffer_ = std::vector<char>(kRandomAccessStreamBufferBytes);
+    std::vector<char> buffer_ = std::vector<char>(kRandomAccessWriterStreamBufferBytes);
     std::uint64_t position_ = 0;
 };
 
@@ -228,7 +229,7 @@ protected:
 
 private:
     storage::IRandomAccessReader& reader_;
-    std::vector<char> buffer_ = std::vector<char>(kRandomAccessStreamBufferBytes);
+    std::vector<char> buffer_ = std::vector<char>(kRandomAccessReaderStreamBufferBytes);
     std::uint64_t offset_ = 0;
     bool failed_ = false;
     std::string error_message_;

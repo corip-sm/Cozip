@@ -637,17 +637,21 @@ std::size_t ResolveZipStreamChunkSize(const ZipEntrySource& entry,
 {
     auto chunk_size = std::max<std::size_t>(64 * 1024, pipeline_options.chunk_size_bytes);
 
-    if (entry.size >= 256u * 1024u * 1024u)
+    if (entry.size >= 1024u * 1024u * 1024u)
     {
-        chunk_size = std::max<std::size_t>(chunk_size, 8u * 1024u * 1024u);
+        chunk_size = std::max<std::size_t>(chunk_size, 32u * 1024u * 1024u);
+    }
+    else if (entry.size >= 256u * 1024u * 1024u)
+    {
+        chunk_size = std::max<std::size_t>(chunk_size, 16u * 1024u * 1024u);
     }
     else if (entry.size >= 64u * 1024u * 1024u)
     {
-        chunk_size = std::max<std::size_t>(chunk_size, 4u * 1024u * 1024u);
+        chunk_size = std::max<std::size_t>(chunk_size, 8u * 1024u * 1024u);
     }
     else if (entry.size >= 16u * 1024u * 1024u)
     {
-        chunk_size = std::max<std::size_t>(chunk_size, 2u * 1024u * 1024u);
+        chunk_size = std::max<std::size_t>(chunk_size, 4u * 1024u * 1024u);
     }
 
     return chunk_size;

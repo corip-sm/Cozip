@@ -88,6 +88,42 @@ ZipOperationResult MaybePreferStoreFromSample(ZipEntrySource& entry)
 
     return {ZipStatus::Ok, {}};
 }
+
+pipeline::PipelineOptions TuneCreatePipelineOptions(const std::vector<ZipEntrySource>& entries,
+                                                    pipeline::PipelineOptions options) noexcept
+{
+    std::uint64_t total_input_bytes = 0;
+    std::uint64_t largest_file_bytes = 0;
+    for (const auto& entry : entries)
+    {
+        if (entry.is_directory)
+        {
+            continue;
+        }
+
+        total_input_bytes += entry.size;
+        largest_file_bytes = std::max<std::uint64_t>(largest_file_bytes, entry.size);
+    }
+
+    if (total_input_bytes >= (32ull * 1024ull * 1024ull * 1024ull) ||
+        largest_file_bytes >= (4ull * 1024ull * 1024ull * 1024ull))
+    {
+        options.chunk_size_bytes = std::max<std::size_t>(options.chunk_size_bytes, 16u * 1024u * 1024u);
+        options.max_in_flight_chunks = std::min<std::size_t>(options.max_in_flight_chunks, 24);
+    }
+    else if (total_input_bytes >= (8ull * 1024ull * 1024ull * 1024ull) ||
+             largest_file_bytes >= (1024ull * 1024ull * 1024ull))
+    {
+        options.chunk_size_bytes = std::max<std::size_t>(options.chunk_size_bytes, 8u * 1024u * 1024u);
+        options.max_in_flight_chunks = std::min<std::size_t>(options.max_in_flight_chunks, 32);
+    }
+    else if (total_input_bytes >= (2ull * 1024ull * 1024ull * 1024ull))
+    {
+        options.chunk_size_bytes = std::max<std::size_t>(options.chunk_size_bytes, 4u * 1024u * 1024u);
+    }
+
+    return options;
+}
 }
 
 ZipOperationResult CompressSmallFileWithLibdeflate(std::ostream& output,
@@ -946,7 +982,8 @@ ZipOperationResult CreateZipArchiveToWriter(storage::IRandomAccessWriter& writer
     }
     RandomAccessWriterOStream output(writer);
 
-    const auto pipeline_plan = pipeline::BuildPipelinePlan(job);
+    auto pipeline_plan = pipeline::BuildPipelinePlan(job);
+    pipeline_plan.options = TuneCreatePipelineOptions(entries, pipeline_plan.options);
     const auto encryption_mode = ResolveZipEncryptionMode(execution);
     if (encryption_mode == core::EncryptionMode::None)
     {
