@@ -29,6 +29,12 @@ Cozip는 표준 ZIP 호환성을 유지하면서 압축과 해제 성능을 끌�
 - 미지원 암호: `WinZip AES`
 - 핵심 명령: `create`, `extract`, `list`, `test`
 
+## License
+
+Cozip는 MIT License로 배포됩니다. 사용, 수정, 배포, 상업적 이용이 가능하며 저작권 고지와 라이선스 문구를 유지해야 합니다.
+
+자세한 내용은 [LICENSE](LICENSE)를 참고하세요.
+
 ## Requirements
 
 - `CMake 3.24+`
