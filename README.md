@@ -29,19 +29,6 @@ Cozip는 표준 ZIP 호환성을 유지하면서 압축과 해제 성능을 끌�
 - 미지원 암호: `WinZip AES`
 - 핵심 명령: `create`, `extract`, `list`, `test`
 
-## Performance Snapshot
-
-로컬 `Release` 기준 순차 측정 요약입니다. 환경과 데이터셋에 따라 결과는 달라질 수 있습니다.
-
-| Dataset | Tool | Compress | Extract |
-| --- | --- | ---: | ---: |
-| 1GB | Cozip | 0.895 s | 0.476 s |
-| 1GB | Bandizip | 1.794 s | 0.568 s |
-| 10GB | Cozip | 11.072 s | 6.927 s |
-| 10GB | Bandizip | 18.822 s | 10.821 s |
-| 40GB | Cozip | 80.292 s | 54.366 s |
-| 40GB | Bandizip | 85.680 s | 76.362 s |
-
 ## Requirements
 
 - `CMake 3.24+`
