@@ -1,10 +1,37 @@
 #include "zip_archive_internal.h"
+#include "zip_chunked_cpu.h"
 
 namespace cozip::format_zip
 {
 namespace
 {
+enum class ZipCreateExecutionPath
+{
+    Directory,
+    Prepared,
+    Store,
+    WholeBufferLibdeflate,
+    ChunkedCpu,
+    StreamDeflate,
+};
+
+struct ZipChunkPlan
+{
+    std::size_t index = 0;
+    std::uint64_t offset = 0;
+    std::size_t size = 0;
+};
+
+struct ZipCreateExecutionPlan
+{
+    ZipCreateExecutionPath path = ZipCreateExecutionPath::StreamDeflate;
+    std::size_t chunk_size_bytes = 0;
+    std::vector<ZipChunkPlan> chunks;
+};
+
 constexpr std::size_t kAdaptiveStoreSampleBytes = 2u * 1024u * 1024u;
+constexpr std::size_t kChunkedCpuMinFileBytes = 256u * 1024u * 1024u;
+constexpr std::size_t kChunkedCpuMinChunkCount = 8;
 constexpr std::uint32_t kAdaptiveStoreMinFileBytes = 8u * 1024u * 1024u;
 constexpr std::uint32_t kAdaptiveStoreThresholdX1000 = 980u;
 constexpr std::uint32_t kAdaptiveStoreFastLargeFileThresholdX1000 = 830u;
@@ -58,8 +85,181 @@ bool SampleLooksIncompressible(const ZipEntrySource& entry, std::span<const std:
     return incompressible;
 }
 
+bool ShouldWholeBufferPrecompress(const ZipEntrySource& entry,
+                                  const pipeline::PipelineOptions& pipeline_options,
+                                  std::size_t memory_budget_mb) noexcept
+{
+    if (entry.is_directory || entry.method != codecs::ZipMethod::Deflate)
+    {
+        return false;
+    }
+
+    const auto whole_buffer_threshold =
+        ResolveLibdeflateWholeBufferThreshold(pipeline_options, memory_budget_mb);
+    return entry.size > 0 && entry.size <= whole_buffer_threshold;
+}
+
+const char* ToString(ZipCreateExecutionPath path) noexcept
+{
+    switch (path)
+    {
+    case ZipCreateExecutionPath::Directory:
+        return "directory";
+    case ZipCreateExecutionPath::Prepared:
+        return "prepared";
+    case ZipCreateExecutionPath::Store:
+        return "store";
+    case ZipCreateExecutionPath::WholeBufferLibdeflate:
+        return "whole-buffer-libdeflate";
+    case ZipCreateExecutionPath::ChunkedCpu:
+        return "chunked-cpu";
+    case ZipCreateExecutionPath::StreamDeflate:
+        return "stream-deflate";
+    }
+
+    return "unknown";
+}
+
+std::vector<ZipChunkPlan> BuildChunkPlan(const ZipEntrySource& entry,
+                                         std::size_t chunk_size_bytes)
+{
+    std::vector<ZipChunkPlan> chunks;
+    if (entry.is_directory || entry.size == 0 || chunk_size_bytes == 0)
+    {
+        return chunks;
+    }
+
+    const auto file_size = static_cast<std::uint64_t>(entry.size);
+    chunks.reserve(static_cast<std::size_t>((file_size + chunk_size_bytes - 1) / chunk_size_bytes));
+
+    std::uint64_t offset = 0;
+    std::size_t index = 0;
+    while (offset < file_size)
+    {
+        const auto remaining = file_size - offset;
+        const auto size = static_cast<std::size_t>(
+            std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(chunk_size_bytes)));
+        chunks.push_back(ZipChunkPlan {
+            .index = index,
+            .offset = offset,
+            .size = size,
+        });
+        offset += static_cast<std::uint64_t>(size);
+        ++index;
+    }
+
+    return chunks;
+}
+
+bool ShouldUseChunkedCpu(const ZipEntrySource& entry,
+                         const ZipCreateExecutionPlan& plan) noexcept
+{
+    const char* disabled = std::getenv("COZIP_DISABLE_CHUNKED_CPU");
+    if (disabled != nullptr && disabled[0] != '\0' && disabled[0] != '0')
+    {
+        return false;
+    }
+
+    if (entry.is_directory || entry.method != codecs::ZipMethod::Deflate)
+    {
+        return false;
+    }
+
+    if (entry.compression_profile != core::CompressionProfile::Fast)
+    {
+        return false;
+    }
+
+    if (entry.size < kChunkedCpuMinFileBytes)
+    {
+        return false;
+    }
+
+    return plan.chunks.size() >= kChunkedCpuMinChunkCount;
+}
+
+std::size_t ResolveChunkedCpuChunkSize(const ZipEntrySource& entry,
+                                       const pipeline::PipelineOptions& pipeline_options) noexcept
+{
+    return ResolveZipStreamChunkSize(entry, pipeline_options);
+}
+
+ZipCreateExecutionPlan BuildExecutionPlan(const ZipEntrySource& entry,
+                                          const pipeline::PipelineOptions& pipeline_options,
+                                          std::size_t memory_budget_mb) noexcept
+{
+    ZipCreateExecutionPlan plan {};
+    plan.chunk_size_bytes = ResolveChunkedCpuChunkSize(entry, pipeline_options);
+    plan.chunks = BuildChunkPlan(entry, plan.chunk_size_bytes);
+
+    if (entry.is_directory)
+    {
+        plan.path = ZipCreateExecutionPath::Directory;
+        return plan;
+    }
+
+    if (!entry.prepared_data.empty())
+    {
+        plan.path = ZipCreateExecutionPath::Prepared;
+        return plan;
+    }
+
+    if (entry.method == codecs::ZipMethod::Store)
+    {
+        plan.path = ZipCreateExecutionPath::Store;
+        return plan;
+    }
+
+    if (ShouldUseChunkedCpu(entry, plan))
+    {
+        plan.path = ZipCreateExecutionPath::ChunkedCpu;
+        return plan;
+    }
+
+    if (ShouldWholeBufferPrecompress(entry, pipeline_options, memory_budget_mb))
+    {
+        plan.path = ZipCreateExecutionPath::WholeBufferLibdeflate;
+        return plan;
+    }
+
+    plan.path = ZipCreateExecutionPath::StreamDeflate;
+    return plan;
+}
+
+void TraceExecutionPlan(const ZipEntrySource& entry,
+                        const ZipCreateExecutionPlan& plan,
+                        std::size_t memory_budget_mb)
+{
+    if (!ZipTimingTraceEnabled())
+    {
+        return;
+    }
+
+    std::ostringstream stream;
+    stream << "entry-plan entry=\"" << entry.archive_path << "\""
+           << " size=" << entry.size
+           << " method=" << static_cast<int>(entry.method)
+           << " path=" << ToString(plan.path)
+           << " chunk=" << plan.chunk_size_bytes
+           << " chunks=" << plan.chunks.size()
+           << " memory_mb=" << memory_budget_mb;
+    if (!plan.chunks.empty())
+    {
+        stream << " first_chunk=" << plan.chunks.front().size;
+        stream << " last_chunk=" << plan.chunks.back().size;
+    }
+    EmitZipTimingTrace(stream.str());
+}
+
 ZipOperationResult MaybePreferStoreFromSample(ZipEntrySource& entry)
 {
+    if (entry.adaptive_store_evaluated)
+    {
+        return {ZipStatus::Ok, {}};
+    }
+
+    entry.adaptive_store_evaluated = true;
+
     if (!IsAdaptiveStoreCandidate(entry) || entry.storage_factory == nullptr)
     {
         return {ZipStatus::Ok, {}};
@@ -145,14 +345,6 @@ ZipOperationResult CompressSmallFileWithLibdeflate(std::ostream& output,
     }
     timer.AddPhase("load", std::chrono::steady_clock::now() - load_started_at);
 
-    const auto crc_started_at = std::chrono::steady_clock::now();
-    Crc32 crc;
-    if (!input.bytes.empty())
-    {
-        crc.Update(input.bytes.data(), input.bytes.size());
-    }
-    timer.AddPhase("crc", std::chrono::steady_clock::now() - crc_started_at);
-
     const auto deflate_started_at = std::chrono::steady_clock::now();
     auto compressed = codecs::CompressDeflateBuffer(
         input.bytes,
@@ -162,6 +354,23 @@ ZipOperationResult CompressSmallFileWithLibdeflate(std::ostream& output,
         return MakeError(ZipStatus::IoError, compressed.error_message + ": " + entry.source_path.string());
     }
     timer.AddPhase("deflate", std::chrono::steady_clock::now() - deflate_started_at);
+
+    if (compressed.has_crc32)
+    {
+        entry.crc32 = compressed.crc32;
+        timer.AddPhase("crc", std::chrono::steady_clock::duration::zero());
+    }
+    else
+    {
+        const auto crc_started_at = std::chrono::steady_clock::now();
+        Crc32 crc;
+        if (!input.bytes.empty())
+        {
+            crc.Update(input.bytes.data(), input.bytes.size());
+        }
+        entry.crc32 = crc.Finalize();
+        timer.AddPhase("crc", std::chrono::steady_clock::now() - crc_started_at);
+    }
 
     const auto write_started_at = std::chrono::steady_clock::now();
     output.write(
@@ -173,7 +382,6 @@ ZipOperationResult CompressSmallFileWithLibdeflate(std::ostream& output,
     }
     timer.AddPhase("write", std::chrono::steady_clock::now() - write_started_at);
 
-    entry.crc32 = crc.Finalize();
     entry.size = static_cast<std::uint32_t>(input.bytes.size());
     entry.compressed_size = static_cast<std::uint32_t>(compressed.bytes.size());
     entry.prepared_backend = compressed.backend;
@@ -331,6 +539,7 @@ ZipOperationResult PrecompressSmallEntries(std::vector<ZipEntrySource>& entries,
     constexpr std::size_t kMinParallelCandidateCount = 2;
     constexpr std::size_t kMinParallelInputBytes = 8 * 1024 * 1024;
     constexpr std::size_t kPrecompressReserveBytes = 512ull * 1024ull * 1024ull;
+    constexpr std::size_t kMinSinglePrecompressBytes = 256ull * 1024ull * 1024ull;
 
     std::vector<std::size_t> candidate_indexes;
     std::size_t prepared_input_bytes = 0;
@@ -362,6 +571,14 @@ ZipOperationResult PrecompressSmallEntries(std::vector<ZipEntrySource>& entries,
             continue;
         }
 
+        ZipCreateExecutionPlan candidate_plan {};
+        candidate_plan.chunk_size_bytes = ResolveZipStreamChunkSize(entry, pipeline_options);
+        candidate_plan.chunks = BuildChunkPlan(entry, candidate_plan.chunk_size_bytes);
+        if (ShouldUseChunkedCpu(entry, candidate_plan))
+        {
+            continue;
+        }
+
         if (entry.size == 0 || entry.size > whole_buffer_threshold)
         {
             continue;
@@ -383,7 +600,12 @@ ZipOperationResult PrecompressSmallEntries(std::vector<ZipEntrySource>& entries,
         return {ZipStatus::Ok, {}};
     }
 
-    if (candidate_indexes.size() < kMinParallelCandidateCount ||
+    const bool allow_single_large_candidate =
+        candidate_indexes.size() == 1 &&
+        prepared_input_bytes >= kMinSinglePrecompressBytes;
+
+    if ((!allow_single_large_candidate &&
+         candidate_indexes.size() < kMinParallelCandidateCount) ||
         prepared_input_bytes < kMinParallelInputBytes)
     {
         return {ZipStatus::Ok, {}};
@@ -763,12 +985,60 @@ bool TryWriteMappedStoreEntry(storage::IRandomAccessReader& reader,
     return true;
 }
 
+ZipOperationResult ExecutePreparedEntry(std::ostream& output, ZipEntrySource& entry)
+{
+    output.write(
+        reinterpret_cast<const char*>(entry.prepared_data.data()),
+        static_cast<std::streamsize>(entry.prepared_data.size()));
+    if (!output)
+    {
+        return MakeError(ZipStatus::IoError, "failed to write prepared deflate data");
+    }
+
+    return {ZipStatus::Ok, {}};
+}
+
+ZipOperationResult ExecuteStoredEntry(std::ostream& output,
+                                      ZipEntrySource& entry,
+                                      storage::IRandomAccessReader& reader,
+                                      std::istream& input,
+                                      std::vector<std::byte>& input_buffer)
+{
+    std::string map_error;
+    if (TryWriteMappedStoreEntry(reader, output, entry, map_error))
+    {
+        return {ZipStatus::Ok, {}};
+    }
+    if (!map_error.empty())
+    {
+        return MakeError(ZipStatus::IoError, map_error);
+    }
+
+    return StreamStoreEntry(input, output, input_buffer, entry);
+}
+
+ZipOperationResult ExecuteWholeBufferLibdeflateEntry(std::ostream& output,
+                                                     ZipEntrySource& entry)
+{
+    auto prepare_result = PrepareSmallEntryWithLibdeflate(entry);
+    if (prepare_result.status != ZipStatus::Ok)
+    {
+        return prepare_result;
+    }
+
+    return ExecutePreparedEntry(output, entry);
+}
+
 ZipOperationResult StreamEntryData(std::ostream& output,
                                    ZipEntrySource& entry,
                                    const pipeline::PipelineOptions& pipeline_options,
-                                    std::size_t memory_budget_mb)
+                                   std::size_t memory_budget_mb)
 {
-    if (entry.is_directory)
+    const auto execution_plan =
+        BuildExecutionPlan(entry, pipeline_options, memory_budget_mb);
+    TraceExecutionPlan(entry, execution_plan, memory_budget_mb);
+
+    if (execution_plan.path == ZipCreateExecutionPath::Directory)
     {
         entry.crc32 = 0;
         entry.size = 0;
@@ -776,17 +1046,9 @@ ZipOperationResult StreamEntryData(std::ostream& output,
         return {ZipStatus::Ok, {}};
     }
 
-    if (!entry.prepared_data.empty())
+    if (execution_plan.path == ZipCreateExecutionPath::Prepared)
     {
-        output.write(
-            reinterpret_cast<const char*>(entry.prepared_data.data()),
-            static_cast<std::streamsize>(entry.prepared_data.size()));
-        if (!output)
-        {
-            return MakeError(ZipStatus::IoError, "failed to write prepared deflate data");
-        }
-
-        return {ZipStatus::Ok, {}};
+        return ExecutePreparedEntry(output, entry);
     }
 
     std::unique_ptr<storage::IRandomAccessReader> opened_reader;
@@ -808,21 +1070,11 @@ ZipOperationResult StreamEntryData(std::ostream& output,
 
     RandomAccessReaderIStream input(*reader);
 
-    const auto chunk_size = ResolveZipStreamChunkSize(entry, pipeline_options);
+    const auto chunk_size = execution_plan.chunk_size_bytes;
     std::vector<std::byte> input_buffer(chunk_size);
-    if (entry.method == codecs::ZipMethod::Store)
+    if (execution_plan.path == ZipCreateExecutionPath::Store)
     {
-        std::string map_error;
-        if (TryWriteMappedStoreEntry(*reader, output, entry, map_error))
-        {
-            return {ZipStatus::Ok, {}};
-        }
-        if (!map_error.empty())
-        {
-            return MakeError(ZipStatus::IoError, map_error);
-        }
-
-        auto result = StreamStoreEntry(input, output, input_buffer, entry);
+        auto result = ExecuteStoredEntry(output, entry, *reader, input, input_buffer);
         if (result.status == ZipStatus::Ok && input.Failed())
         {
             return MakeError(ZipStatus::IoError, input.ErrorMessage());
@@ -830,17 +1082,29 @@ ZipOperationResult StreamEntryData(std::ostream& output,
         return result;
     }
 
-    const auto whole_buffer_threshold =
-        ResolveLibdeflateWholeBufferThreshold(pipeline_options, memory_budget_mb);
     auto sample_result = MaybePreferStoreFromSample(entry);
     if (sample_result.status != ZipStatus::Ok)
     {
         return sample_result;
     }
 
-    if (entry.size > 0 && entry.size <= whole_buffer_threshold)
+    if (execution_plan.path == ZipCreateExecutionPath::WholeBufferLibdeflate)
     {
-        return CompressSmallFileWithLibdeflate(output, entry);
+        return ExecuteWholeBufferLibdeflateEntry(output, entry);
+    }
+
+    if (execution_plan.path == ZipCreateExecutionPath::ChunkedCpu)
+    {
+        auto result = ExecuteChunkedCpuEntry(
+            output,
+            entry,
+            pipeline_options,
+            execution_plan.chunk_size_bytes);
+        if (result.status == ZipStatus::Ok && input.Failed())
+        {
+            return MakeError(ZipStatus::IoError, input.ErrorMessage());
+        }
+        return result;
     }
 
     auto result = StreamDeflateEntry(
@@ -987,13 +1251,27 @@ ZipOperationResult CreateZipArchiveToWriter(storage::IRandomAccessWriter& writer
     const auto encryption_mode = ResolveZipEncryptionMode(execution);
     if (encryption_mode == core::EncryptionMode::None)
     {
-        const auto prepare_result = PrecompressSmallEntries(
-            entries,
-            pipeline_plan.options,
-            execution.memory_budget_mb);
-        if (prepare_result.status != ZipStatus::Ok)
+        bool should_precompress = true;
+        for (const auto& entry : entries)
         {
-            return prepare_result;
+            const auto execution_plan =
+                BuildExecutionPlan(entry, pipeline_plan.options, execution.memory_budget_mb);
+            if (execution_plan.path == ZipCreateExecutionPath::ChunkedCpu)
+            {
+                should_precompress = false;
+                break;
+            }
+        }
+        if (should_precompress)
+        {
+            const auto prepare_result = PrecompressSmallEntries(
+                entries,
+                pipeline_plan.options,
+                execution.memory_budget_mb);
+            if (prepare_result.status != ZipStatus::Ok)
+            {
+                return prepare_result;
+            }
         }
     }
 
@@ -1028,6 +1306,19 @@ ZipOperationResult CreateZipArchiveToWriter(storage::IRandomAccessWriter& writer
             if (prepare_result.status != ZipStatus::Ok)
             {
                 return prepare_result;
+            }
+        }
+        else if (entry.prepared_data.empty())
+        {
+            const auto execution_plan =
+                BuildExecutionPlan(entry, pipeline_plan.options, execution.memory_budget_mb);
+            if (execution_plan.path == ZipCreateExecutionPath::WholeBufferLibdeflate)
+            {
+                auto prepare_result = PrepareSmallEntryWithLibdeflate(entry);
+                if (prepare_result.status != ZipStatus::Ok)
+                {
+                    return prepare_result;
+                }
             }
         }
 

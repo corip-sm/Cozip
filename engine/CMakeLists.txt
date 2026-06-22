@@ -52,6 +52,7 @@ add_library(cozip_engine
     format_zip/src/zip_archive_api.cpp
     format_zip/src/zip_archive_common.cpp
     format_zip/src/zip_archive_crypto.cpp
+    format_zip/src/zip_chunked_cpu.cpp
     format_zip/src/zip_archive_create.cpp
     format_zip/src/zip_archive_read_extract.cpp
     format_zip/src/zip_archive_read_shared.cpp

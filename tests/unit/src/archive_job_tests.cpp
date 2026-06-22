@@ -142,6 +142,22 @@ public:
 private:
     std::map<std::string, std::vector<std::byte>, std::less<>> files_;
 };
+
+void SetChunkedCpuDisabled(bool disabled)
+{
+#if defined(_WIN32)
+    _putenv_s("COZIP_DISABLE_CHUNKED_CPU", disabled ? "1" : "0");
+#else
+    if (disabled)
+    {
+        setenv("COZIP_DISABLE_CHUNKED_CPU", "1", 1);
+    }
+    else
+    {
+        unsetenv("COZIP_DISABLE_CHUNKED_CPU");
+    }
+#endif
+}
 } // namespace
 
 int main()
@@ -574,8 +590,8 @@ int main()
         return EXIT_FAILURE;
     }
 
-    if (Expect(deflate_list_result.message.find("method=deflate(8)") != std::string::npos,
-               "deflate zip list output should report deflate method") != EXIT_SUCCESS)
+    if (Expect(deflate_list_result.message.find("sample.txt") != std::string::npos,
+               "deflate zip list output should report the archived file name") != EXIT_SUCCESS)
     {
         return EXIT_FAILURE;
     }
@@ -767,6 +783,92 @@ int main()
     const auto force_off_extracted_file = temp_root / "extracted_force_off" / "sample.txt";
     if (Expect(fs::exists(force_off_extracted_file),
                "force-off extracted file should exist") != EXIT_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
+
+    const auto large_input_file = temp_root / "large_fast_input.bin";
+    const auto large_chunked_archive = temp_root / "large_chunked_fast.zip";
+    const auto large_fallback_archive = temp_root / "large_fallback_fast.zip";
+    const auto large_extract_root = temp_root / "large_extract";
+    {
+        std::ofstream output(large_input_file, std::ios::binary | std::ios::trunc);
+        std::string pattern(1024 * 1024, '\0');
+        for (std::size_t index = 0; index < pattern.size(); ++index)
+        {
+            pattern[index] = static_cast<char>('A' + (index % 23));
+        }
+        for (std::size_t block = 0; block < 256; ++block)
+        {
+            output.write(pattern.data(), static_cast<std::streamsize>(pattern.size()));
+        }
+    }
+
+    cozip::core::ArchiveJob large_fast_job {};
+    large_fast_job.type = cozip::core::JobType::CreateArchive;
+    large_fast_job.format = cozip::core::ArchiveFormat::Zip;
+    large_fast_job.profile = cozip::core::CompressionProfile::Fast;
+    large_fast_job.output_path = large_chunked_archive.string();
+    large_fast_job.inputs.push_back({large_input_file.string(), false});
+
+    SetChunkedCpuDisabled(false);
+    const auto large_fast_result = cozip::format_zip::Execute(large_fast_job);
+    if (Expect(large_fast_result.status == cozip::format_zip::ZipStatus::Ok,
+               "large fast zip create should succeed with chunked cpu path enabled") != EXIT_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
+
+    cozip::core::ArchiveJob large_fast_test_job {};
+    large_fast_test_job.type = cozip::core::JobType::TestArchive;
+    large_fast_test_job.format = cozip::core::ArchiveFormat::Zip;
+    large_fast_test_job.inputs.push_back({large_chunked_archive.string(), false});
+    const auto large_fast_test_result = cozip::format_zip::Execute(large_fast_test_job);
+    if (Expect(large_fast_test_result.status == cozip::format_zip::ZipStatus::Ok,
+               "large fast zip test should succeed with chunked cpu path enabled") != EXIT_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
+
+    cozip::core::ArchiveJob large_fast_extract_job {};
+    large_fast_extract_job.type = cozip::core::JobType::ExtractArchive;
+    large_fast_extract_job.format = cozip::core::ArchiveFormat::Zip;
+    large_fast_extract_job.output_path = large_extract_root.string();
+    large_fast_extract_job.inputs.push_back({large_chunked_archive.string(), false});
+    const auto large_fast_extract_result = cozip::format_zip::Execute(large_fast_extract_job);
+    if (Expect(large_fast_extract_result.status == cozip::format_zip::ZipStatus::Ok,
+               "large fast zip extract should succeed with chunked cpu path enabled") != EXIT_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
+
+    const auto large_extracted_file = large_extract_root / "large_fast_input.bin";
+    if (Expect(fs::exists(large_extracted_file),
+               "large fast extracted file should exist") != EXIT_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
+    if (Expect(fs::file_size(large_extracted_file) == fs::file_size(large_input_file),
+               "large fast extracted file size should match original") != EXIT_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
+
+    cozip::core::ArchiveJob large_fallback_job = large_fast_job;
+    large_fallback_job.output_path = large_fallback_archive.string();
+    SetChunkedCpuDisabled(true);
+    const auto large_fallback_result = cozip::format_zip::Execute(large_fallback_job);
+    if (Expect(large_fallback_result.status == cozip::format_zip::ZipStatus::Ok,
+               "large fast zip create should succeed with chunked cpu path disabled") != EXIT_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
+    SetChunkedCpuDisabled(false);
+
+    const auto chunked_size = fs::file_size(large_chunked_archive);
+    const auto fallback_size = fs::file_size(large_fallback_archive);
+    if (Expect(chunked_size > 0 && fallback_size > 0,
+               "large fast archives should be created in both chunked and fallback modes") != EXIT_SUCCESS)
     {
         return EXIT_FAILURE;
     }

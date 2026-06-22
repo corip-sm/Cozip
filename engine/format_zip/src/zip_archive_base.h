@@ -80,6 +80,7 @@ struct ZipEntrySource
     core::CompressionProfile compression_profile = core::CompressionProfile::Balanced;
     std::vector<std::byte> prepared_data;
     bool is_directory = false;
+    bool adaptive_store_evaluated = false;
     core::MappingMode mapping_mode = core::MappingMode::Auto;
     storage::IStorageFactory* storage_factory = nullptr;
     storage::IRandomAccessReader* source_reader = nullptr;

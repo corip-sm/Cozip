@@ -272,7 +272,7 @@ bool ShouldTryMapReader(const storage::IRandomAccessReader& reader,
                         core::MappingMode mapping_mode,
                         std::uint64_t source_size,
                         std::size_t requested_window_bytes,
-                        std::uint64_t auto_threshold_bytes) noexcept
+                        std::uintmax_t auto_threshold_bytes) noexcept
 {
     const auto capabilities = reader.Capabilities();
     if (!capabilities.supports_mapping || mapping_mode == core::MappingMode::ForceOff)
@@ -372,6 +372,7 @@ bool AddDirectoryEntry(const fs::path& directory_path,
         core::CompressionProfile::Balanced,
         {},
         true,
+        false,
         core::MappingMode::Auto,
         nullptr,
         nullptr});
@@ -414,6 +415,7 @@ ZipOperationResult CollectRegularFile(const fs::path& file_path,
         core::CompressionProfile::Balanced,
         {},
         false,
+        false,
         core::MappingMode::Auto,
         nullptr,
         nullptr});
@@ -452,6 +454,7 @@ ZipOperationResult CollectReaderFile(const core::ArchiveSource& input,
         codecs::DeflateBackend::None,
         core::CompressionProfile::Balanced,
         {},
+        false,
         false,
         core::MappingMode::Auto,
         nullptr,
