@@ -19,8 +19,13 @@ foreach(COZIP_MINIZ_FILE IN ITEMS
         COPYONLY)
 endforeach()
 
-file(WRITE ${COZIP_MINIZ_BUILD_DIR}/miniz_export.h
-"#pragma once\n\n#ifndef MINIZ_EXPORT\n#define MINIZ_EXPORT\n#endif\n")
+# Configure-time generated files must preserve their timestamp when their
+# content is unchanged. Otherwise every top-level CMake configure invalidates
+# all translation units that include this compatibility header.
+file(CONFIGURE
+    OUTPUT ${COZIP_MINIZ_BUILD_DIR}/miniz_export.h
+    CONTENT "#pragma once\n\n#ifndef MINIZ_EXPORT\n#define MINIZ_EXPORT\n#endif\n"
+    @ONLY)
 
 add_library(cozip_engine
     ../third_party/libdeflate-src/lib/adler32.c
