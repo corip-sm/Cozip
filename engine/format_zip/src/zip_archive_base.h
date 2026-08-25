@@ -4,8 +4,6 @@
 #include "cozip/codecs/deflate_codec.h"
 #include "cozip/codecs/zip_method.h"
 #include "cozip/pipeline/archive_pipeline.h"
-#include "cozip/pipeline/bounded_queue.h"
-#include "cozip/pipeline/buffer_pool.h"
 #include "cozip/platform/filesystem_random_access.h"
 #include "cozip/platform/filesystem_storage_factory.h"
 #include "cozip/platform/mapped_file.h"
@@ -141,59 +139,4 @@ inline void EmitZipTimingTrace(const std::string& line)
     std::cerr << "[zip-trace] " << line << '\n';
 }
 
-class ScopedZipEntryTimer
-{
-public:
-    explicit ScopedZipEntryTimer(const ZipEntrySource& entry)
-        : entry_(entry),
-          started_at_(std::chrono::steady_clock::now())
-    {
-    }
-
-    void AddPhase(std::string_view name, std::chrono::steady_clock::duration duration)
-    {
-        if (!ZipTimingTraceEnabled())
-        {
-            return;
-        }
-
-        if (!phases_.empty())
-        {
-            phases_ += ' ';
-        }
-
-        phases_ += std::string(name);
-        phases_ += '=';
-        phases_ += std::to_string(
-            std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
-        phases_ += "ms";
-    }
-
-    void Finish() const
-    {
-        if (!ZipTimingTraceEnabled())
-        {
-            return;
-        }
-
-        const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                  std::chrono::steady_clock::now() - started_at_)
-                                  .count();
-        std::ostringstream stream;
-        stream << "entry=\"" << entry_.archive_path << "\""
-               << " size=" << entry_.size
-               << " method=" << static_cast<int>(entry_.method)
-               << " total=" << total_ms << "ms";
-        if (!phases_.empty())
-        {
-            stream << ' ' << phases_;
-        }
-        EmitZipTimingTrace(stream.str());
-    }
-
-private:
-    const ZipEntrySource& entry_;
-    std::chrono::steady_clock::time_point started_at_;
-    std::string phases_;
-};
 }

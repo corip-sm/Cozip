@@ -19,6 +19,7 @@
 
 #include "cozip/core/archive_request.h"
 #include "cozip/format_zip/zip_archive.h"
+#include "cozip/platform/filesystem_random_access.h"
 #include "cozip/storage/storage_factory.h"
 #include "zip_chunked_cpu.h"
 
@@ -154,6 +155,91 @@ public:
 
 private:
     std::shared_ptr<OutputState> output_;
+};
+
+struct ReaderLifecycleState
+{
+    std::size_t open_readers = 0;
+    std::size_t max_open_readers = 0;
+    std::size_t total_opened = 0;
+};
+
+class CountingReader final : public cozip::storage::IRandomAccessReader
+{
+public:
+    CountingReader(
+        std::unique_ptr<cozip::storage::IRandomAccessReader> delegate,
+        ReaderLifecycleState& state)
+        : delegate_(std::move(delegate)), state_(state)
+    {
+        ++state_.open_readers;
+        ++state_.total_opened;
+        state_.max_open_readers = std::max(state_.max_open_readers, state_.open_readers);
+    }
+
+    ~CountingReader() override
+    {
+        --state_.open_readers;
+    }
+
+    [[nodiscard]] std::uint64_t Size() const noexcept override { return delegate_->Size(); }
+    [[nodiscard]] cozip::storage::StorageCapabilities Capabilities() const noexcept override
+    {
+        return delegate_->Capabilities();
+    }
+    bool Read(std::uint64_t offset,
+              std::span<std::byte> output,
+              std::size_t& bytes_read,
+              std::string& error) override
+    {
+        return delegate_->Read(offset, output, bytes_read, error);
+    }
+    bool TryMapWindow(std::uint64_t offset,
+                      std::size_t length,
+                      cozip::storage::MappedReadWindow& window,
+                      std::string& error) override
+    {
+        return delegate_->TryMapWindow(offset, length, window, error);
+    }
+
+private:
+    std::unique_ptr<cozip::storage::IRandomAccessReader> delegate_;
+    ReaderLifecycleState& state_;
+};
+
+class CountingPathFactory final : public cozip::storage::IStorageFactory
+{
+public:
+    CountingPathFactory(
+        std::shared_ptr<OutputState> output,
+        ReaderLifecycleState& lifecycle)
+        : output_(std::move(output)), lifecycle_(lifecycle)
+    {
+    }
+
+    [[nodiscard]] std::unique_ptr<cozip::storage::IRandomAccessReader> OpenReader(
+        const std::filesystem::path& path,
+        cozip::core::MappingMode mapping_mode,
+        std::string& error) override
+    {
+        auto reader = std::make_unique<cozip::platform::FilesystemRandomAccessReader>(mapping_mode);
+        if (!reader->Open(path, error))
+        {
+            return {};
+        }
+        return std::make_unique<CountingReader>(std::move(reader), lifecycle_);
+    }
+
+    [[nodiscard]] std::unique_ptr<cozip::storage::IRandomAccessWriter> OpenWriter(
+        const std::filesystem::path&,
+        std::string&) override
+    {
+        return std::make_unique<OwnerWriter>(output_);
+    }
+
+private:
+    std::shared_ptr<OutputState> output_;
+    ReaderLifecycleState& lifecycle_;
 };
 
 class PartialOwnerReader final : public cozip::storage::IRandomAccessReader
@@ -656,6 +742,233 @@ int RunMultiEntryCase(std::size_t workers,
     {
         return EXIT_FAILURE;
     }
+    if (reorder)
+    {
+        std::vector<std::unique_ptr<PartialOwnerReader>> serial_readers;
+        for (const auto& payload : payloads)
+        {
+            serial_readers.push_back(std::make_unique<PartialOwnerReader>(payload, 997));
+        }
+        auto serial_output = std::make_shared<OutputState>();
+        serial_output->owner = std::this_thread::get_id();
+        const auto serial_result = CreateMultiArchive(
+            serial_readers,
+            serial_output,
+            chunk_size,
+            max_in_flight,
+            memory_budget_mb,
+            nullptr);
+        if (Expect(serial_result.status == cozip::format_zip::ZipStatus::Ok,
+                   "serial deterministic archive create should succeed") != EXIT_SUCCESS ||
+            Expect(serial_output->bytes == output->bytes,
+                   "executor completion order must not change ZIP bytes") != EXIT_SUCCESS)
+        {
+            return EXIT_FAILURE;
+        }
+    }
+    return EXIT_SUCCESS;
+}
+
+int RunByteBudgetAdmissionCase()
+{
+    constexpr std::size_t chunk_size = 256u * 1024u;
+    constexpr std::size_t max_in_flight = 8;
+    constexpr std::size_t memory_budget_mb = 1;
+    std::vector<std::vector<std::byte>> payloads;
+    std::vector<std::unique_ptr<PartialOwnerReader>> readers;
+    for (std::size_t index = 0; index < 3; ++index)
+    {
+        payloads.push_back(MakePayload(600u * 1024u + index));
+        readers.push_back(std::make_unique<PartialOwnerReader>(payloads.back(), 4093));
+    }
+    auto output = std::make_shared<OutputState>();
+    output->owner = std::this_thread::get_id();
+    TestExecutor executor(4);
+    const auto result = CreateMultiArchive(
+        readers,
+        output,
+        chunk_size,
+        max_in_flight,
+        memory_budget_mb,
+        &executor);
+    executor.WaitForIdle();
+    const auto metrics =
+        cozip::format_zip::LastChunkedCpuSchedulerMetricsForTesting();
+    if (Expect(result.status == cozip::format_zip::ZipStatus::Ok,
+               "byte-budget archive create should succeed") != EXIT_SUCCESS ||
+        Expect(metrics.max_in_flight_chunks < max_in_flight,
+               "byte budget must limit admission before chunk count") != EXIT_SUCCESS ||
+        Expect(metrics.max_reserved_bytes <= memory_budget_mb * 1024u * 1024u,
+               "byte-budget reservation must remain within one MiB") != EXIT_SUCCESS ||
+        Expect(ValidateArchiveContents(output->bytes, payloads),
+               "byte-budget archive must extract byte-for-byte") != EXIT_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int RunAdaptiveChunkCase()
+{
+    constexpr std::size_t requested_chunk = 64u * 1024u;
+    constexpr std::size_t expected_chunk = 4u * 1024u * 1024u;
+    auto payload = MakePayload(16u * 1024u * 1024u);
+    auto output = std::make_shared<OutputState>();
+    output->owner = std::this_thread::get_id();
+    PartialOwnerReader reader(payload, payload.size());
+    TestExecutor executor(4);
+    const auto result = CreateArchive(
+        reader,
+        output,
+        cozip::core::CompressionProfile::Fast,
+        requested_chunk,
+        4,
+        &executor);
+    executor.WaitForIdle();
+    const auto metrics =
+        cozip::format_zip::LastChunkedCpuSchedulerMetricsForTesting();
+    if (Expect(result.status == cozip::format_zip::ZipStatus::Ok,
+               "adaptive chunk archive create should succeed") != EXIT_SUCCESS ||
+        Expect(metrics.entries.size() == 1,
+               "adaptive chunk metrics should contain one entry") != EXIT_SUCCESS ||
+        Expect(metrics.entries[0].chunk_size_bytes == expected_chunk,
+               "16-MiB entry should use a 4-MiB adaptive chunk") != EXIT_SUCCESS ||
+        Expect(metrics.entries[0].chunk_count == 4,
+               "adaptive scheduler chunk count should match execution plan") != EXIT_SUCCESS ||
+        Expect(ValidateArchive(output->bytes),
+               "adaptive chunk archive should validate") != EXIT_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int RunPathReaderLifecycleCase()
+{
+    static std::atomic<std::size_t> sequence {0};
+    const auto root = std::filesystem::temp_directory_path() /
+        ("cozip_reader_lifecycle_" +
+         std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)));
+    std::filesystem::create_directories(root);
+    constexpr std::size_t file_count = 24;
+    for (std::size_t index = 0; index < file_count; ++index)
+    {
+        const auto payload = MakePayload(96u * 1024u + index);
+        std::ofstream stream(root / ("entry" + std::to_string(index) + ".bin"),
+                             std::ios::binary | std::ios::trunc);
+        stream.write(
+            reinterpret_cast<const char*>(payload.data()),
+            static_cast<std::streamsize>(payload.size()));
+    }
+
+    auto output = std::make_shared<OutputState>();
+    output->owner = std::this_thread::get_id();
+    ReaderLifecycleState lifecycle;
+    CountingPathFactory factory(output, lifecycle);
+    TestExecutor executor(4);
+    cozip::core::ExecutionEnvironment environment {};
+    environment.storage_factory = &factory;
+    environment.task_executor = &executor;
+    cozip::core::ArchiveExecutionRequest request {};
+    request.archive.operation = cozip::core::Operation::Create;
+    request.archive.format = cozip::core::ArchiveFormat::Zip;
+    request.archive.profile = cozip::core::CompressionProfile::Fast;
+    request.archive.output_path = "memory/path-lifecycle.zip";
+    request.archive.execution.chunk_size_bytes = 64u * 1024u;
+    request.archive.execution.max_in_flight_chunks = 4;
+    request.archive.execution.memory_budget_mb = 2;
+    request.archive.execution.mapping_mode = cozip::core::MappingMode::ForceOff;
+    for (std::size_t index = 0; index < file_count; ++index)
+    {
+        request.archive.inputs.push_back({
+            .kind = cozip::core::ArchiveSourceKind::Path,
+            .path = (root / ("entry" + std::to_string(index) + ".bin")).string(),
+            .recursive = false,
+        });
+    }
+    request.context.environment = &environment;
+    const auto result = cozip::format_zip::Execute(request);
+    executor.WaitForIdle();
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(root, cleanup_error);
+    if (Expect(result.status == cozip::format_zip::ZipStatus::Ok,
+               "path reader lifecycle archive should succeed") != EXIT_SUCCESS ||
+        Expect(lifecycle.total_opened == file_count,
+               "every path entry should be opened on first admission") != EXIT_SUCCESS ||
+        Expect(lifecycle.max_open_readers <= 4,
+               "lazy path readers must be bounded by global admission") != EXIT_SUCCESS ||
+        Expect(lifecycle.open_readers == 0,
+               "path readers must close after their entry completes") != EXIT_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int RunMixedEntryCase()
+{
+    static std::atomic<std::size_t> sequence {0};
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("cozip_mixed_directory_" +
+         std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)));
+    std::filesystem::create_directories(directory);
+    auto stored_payload = MakePayload(4u * 1024u * 1024u);
+    auto deflated_payload = MakePayload(512u * 1024u);
+    PartialOwnerReader stored_reader(stored_payload, 4096);
+    PartialOwnerReader deflated_reader(deflated_payload, 4096);
+    auto output = std::make_shared<OutputState>();
+    output->owner = std::this_thread::get_id();
+    MemoryFactory factory(output);
+    TestExecutor executor(4, true);
+    RecordingProgressSink progress;
+    cozip::core::ExecutionEnvironment environment {};
+    environment.storage_factory = &factory;
+    environment.task_executor = &executor;
+    cozip::core::ArchiveExecutionRequest request {};
+    request.archive.operation = cozip::core::Operation::Create;
+    request.archive.format = cozip::core::ArchiveFormat::Zip;
+    request.archive.profile = cozip::core::CompressionProfile::Fast;
+    request.archive.output_path = "memory/mixed.zip";
+    request.archive.execution.chunk_size_bytes = 64u * 1024u;
+    request.archive.execution.max_in_flight_chunks = 6;
+    request.archive.execution.memory_budget_mb = 4;
+    request.archive.inputs.push_back({
+        .kind = cozip::core::ArchiveSourceKind::Path,
+        .path = directory.string(),
+        .recursive = false,
+    });
+    request.archive.inputs.push_back({
+        .kind = cozip::core::ArchiveSourceKind::ReaderFile,
+        .recursive = false,
+        .archive_path = "stored.jpg",
+        .reader = &stored_reader,
+    });
+    request.archive.inputs.push_back({
+        .kind = cozip::core::ArchiveSourceKind::ReaderFile,
+        .recursive = false,
+        .archive_path = "deflated.bin",
+        .reader = &deflated_reader,
+    });
+    request.context.progress = &progress;
+    request.context.environment = &environment;
+    const auto result = cozip::format_zip::Execute(request);
+    executor.WaitForIdle();
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(directory, cleanup_error);
+    const std::vector<std::string> expected_paths {
+        directory.filename().generic_string() + "/",
+        "stored.jpg",
+        "deflated.bin",
+    };
+    if (Expect(result.status == cozip::format_zip::ZipStatus::Ok,
+               "mixed Store/Deflate archive should succeed") != EXIT_SUCCESS ||
+        Expect(progress.completed_paths == expected_paths,
+               "mixed entries must preserve ZIP and progress order") != EXIT_SUCCESS ||
+        Expect(ValidateArchive(output->bytes),
+               "mixed entry archive should validate") != EXIT_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
     return EXIT_SUCCESS;
 }
 } // namespace
@@ -673,7 +986,11 @@ int main()
     }
 
     if (RunMultiEntryCase(1, false, 2) != EXIT_SUCCESS ||
-        RunMultiEntryCase(4, true) != EXIT_SUCCESS)
+        RunMultiEntryCase(4, true) != EXIT_SUCCESS ||
+        RunByteBudgetAdmissionCase() != EXIT_SUCCESS ||
+        RunAdaptiveChunkCase() != EXIT_SUCCESS ||
+        RunPathReaderLifecycleCase() != EXIT_SUCCESS ||
+        RunMixedEntryCase() != EXIT_SUCCESS)
     {
         return EXIT_FAILURE;
     }

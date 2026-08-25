@@ -91,17 +91,11 @@ const char* ToString(ZipCreateExecutionPath path) noexcept
     return "unknown";
 }
 
-std::size_t ResolveChunkedCpuChunkSize(const ZipEntrySource& entry,
-                                       const pipeline::PipelineOptions& pipeline_options) noexcept
-{
-    return ResolveZipStreamChunkSize(entry, pipeline_options);
-}
-
 ZipCreateExecutionPlan BuildExecutionPlan(const ZipEntrySource& entry,
                                           const pipeline::PipelineOptions& pipeline_options) noexcept
 {
     ZipCreateExecutionPlan plan {};
-    plan.chunk_size_bytes = ResolveChunkedCpuChunkSize(entry, pipeline_options);
+    plan.chunk_size_bytes = ResolveZipStreamChunkSize(entry, pipeline_options);
     plan.chunk_count = entry.size == 0 || plan.chunk_size_bytes == 0
         ? 0
         : entry.size / plan.chunk_size_bytes +

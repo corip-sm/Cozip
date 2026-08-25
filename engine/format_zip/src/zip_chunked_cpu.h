@@ -8,6 +8,8 @@ struct ChunkedCpuEntryMetrics
 {
     std::string archive_path;
     std::uint64_t raw_bytes = 0;
+    std::size_t chunk_size_bytes = 0;
+    std::size_t chunk_count = 0;
     std::uint64_t read_ns = 0;
     std::uint64_t deflate_ns = 0;
     std::uint64_t write_ns = 0;

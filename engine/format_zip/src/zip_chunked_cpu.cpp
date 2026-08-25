@@ -24,7 +24,6 @@ struct DeflateStreamLayout
 struct ChunkedCompressedChunk
 {
     std::size_t index = 0;
-    std::size_t raw_size = 0;
     std::size_t retained_reservation = 0;
     std::vector<std::byte> compressed;
     DeflateStreamLayout layout {};
@@ -853,14 +852,10 @@ public:
         PublishTestMetrics();
     }
 
-    ZipOperationResult Initialize(std::span<ZipEntrySource> entries,
-                                  std::size_t chunk_size)
+    ZipOperationResult Initialize(
+        std::span<ZipEntrySource> entries,
+        const pipeline::PipelineOptions& pipeline_options)
     {
-        if (chunk_size == 0)
-        {
-            return MakeError(ZipStatus::InvalidJob, "chunk size must be greater than zero");
-        }
-
         try
         {
             for (auto& entry : entries)
@@ -873,7 +868,11 @@ public:
 
                 auto state = std::make_unique<EntryState>();
                 state->entry = &entry;
-                state->chunk_size = chunk_size;
+                state->chunk_size = ResolveZipStreamChunkSize(entry, pipeline_options);
+                if (state->chunk_size == 0)
+                {
+                    return MakeError(ZipStatus::InvalidJob, "chunk size must be greater than zero");
+                }
                 state->file_size = entry.source_reader != nullptr
                     ? entry.source_reader->Size()
                     : static_cast<std::uint64_t>(entry.size);
@@ -885,30 +884,18 @@ public:
                 }
                 state->chunk_count = state->file_size == 0
                     ? std::size_t {1}
-                    : static_cast<std::size_t>(state->file_size / chunk_size +
-                          (state->file_size % chunk_size != 0 ? 1u : 0u));
+                    : static_cast<std::size_t>(state->file_size / state->chunk_size +
+                          (state->file_size % state->chunk_size != 0 ? 1u : 0u));
 
                 if (entry.source_reader != nullptr)
                 {
                     state->reader = entry.source_reader;
                 }
-                else
-                {
-                    std::string open_error;
-                    if (!OpenRandomAccessReader(
-                            *entry.storage_factory,
-                            entry.source_path,
-                            entry.mapping_mode,
-                            state->opened_reader,
-                            open_error))
-                    {
-                        return MakeError(ZipStatus::IoError, open_error);
-                    }
-                    state->reader = state->opened_reader.get();
-                }
 
                 ChunkedCpuEntryMetrics metrics {};
                 metrics.archive_path = entry.archive_path;
+                metrics.chunk_size_bytes = state->chunk_size;
+                metrics.chunk_count = state->chunk_count;
                 shared_->metrics.entries.push_back(std::move(metrics));
                 entries_.push_back(std::move(state));
             }
@@ -1042,7 +1029,11 @@ public:
         entry.size = static_cast<std::uint32_t>(state.file_size);
         entry.compressed_size = static_cast<std::uint32_t>(bit_writer.TotalBytesWritten());
         entry.general_purpose_flag = kDataDescriptorFlag;
-        state.output_complete = true;
+        state.opened_reader.reset();
+        if (state.entry->source_reader == nullptr)
+        {
+            state.reader = nullptr;
+        }
 
         {
             std::lock_guard lock(shared_->mutex);
@@ -1107,7 +1098,6 @@ private:
         std::size_t next_write_index = 0;
         Crc32 crc;
         bool started = false;
-        bool output_complete = false;
     };
 
     struct SharedState
@@ -1285,6 +1275,11 @@ private:
     ZipOperationResult AdmitOne(std::size_t entry_index)
     {
         auto& state = *entries_[entry_index];
+        auto reader_result = EnsureReaderOpen(state);
+        if (reader_result.status != ZipStatus::Ok)
+        {
+            return reader_result;
+        }
         const auto raw_size = RawSize(state);
         const auto reservation = ReservationFor(raw_size);
         const auto compressed_reserve =
@@ -1499,7 +1494,6 @@ private:
 
             ChunkedCompressedChunk result {};
             result.index = chunk_index;
-            result.raw_size = raw_size;
             result.compressed = std::move(compressed.bytes);
             if (!ParseDeflateStreamLayout(result.compressed, result.layout) ||
                 (!is_final && !PrepareChunkForNonFinalStream(result)))
@@ -1667,6 +1661,26 @@ private:
         {
             --shared_->in_flight_chunks;
         }
+    }
+
+    ZipOperationResult EnsureReaderOpen(EntryState& state)
+    {
+        if (state.reader != nullptr)
+        {
+            return {ZipStatus::Ok, {}};
+        }
+        std::string open_error;
+        if (!OpenRandomAccessReader(
+                *state.entry->storage_factory,
+                state.entry->source_path,
+                state.entry->mapping_mode,
+                state.opened_reader,
+                open_error))
+        {
+            return Fail(MakeError(ZipStatus::IoError, std::move(open_error)));
+        }
+        state.reader = state.opened_reader.get();
+        return {ZipStatus::Ok, {}};
     }
 
     void RejectTask(std::size_t reservation, std::size_t raw_size)
@@ -1850,7 +1864,7 @@ ZipOperationResult CreateChunkedCpuScheduler(
             pipeline_options,
             memory_budget_mb,
             context);
-        auto result = impl->Initialize(entries, pipeline_options.chunk_size_bytes);
+        auto result = impl->Initialize(entries, pipeline_options);
         if (result.status != ZipStatus::Ok)
         {
             return result;
