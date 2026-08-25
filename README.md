@@ -163,6 +163,20 @@ thread. The older `ExecutionEnvironment::thread_pool` field remains source-compa
 used for ZIP compression; adapters should migrate to `task_executor`. Because
 `ExecutionEnvironment` gained a data member, binary clients must be rebuilt against this version.
 
+Multi-entry scheduler benchmark:
+
+```sh
+cmake -S . -B build-release -DCOZIP_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --target cozip_zip_multi_entry_benchmark -j
+./build-release/tests/cozip_zip_multi_entry_benchmark
+```
+
+The benchmark uses 15, 15, 53, 61, 62, and 62 MiB entries with 8 MiB chunks,
+Fast/libdeflate compression, a 256 MiB budget, and executor concurrency 4 and 8.
+It compares sequential single-entry archive requests with one multi-entry archive and reports
+wall time, throughput, per-entry read/deflate/write time, peak executor tasks, peak raw and
+compressed bytes, and how many later entries started before the first entry completed.
+
 암호 ZIP 생성:
 
 ```cpp

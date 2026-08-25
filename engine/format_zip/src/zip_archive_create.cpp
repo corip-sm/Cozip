@@ -398,7 +398,7 @@ ZipOperationResult StreamEntryData(std::ostream& output,
                                    ZipEntrySource& entry,
                                    const pipeline::PipelineOptions& pipeline_options,
                                    std::size_t memory_budget_mb,
-                                   const core::ExecutionContext& context)
+                                   ChunkedCpuCreateScheduler* chunk_scheduler)
 {
     const auto execution_plan =
         BuildExecutionPlan(entry, pipeline_options);
@@ -415,6 +415,17 @@ ZipOperationResult StreamEntryData(std::ostream& output,
     if (execution_plan.path == ZipCreateExecutionPath::Prepared)
     {
         return ExecutePreparedEntry(output, entry);
+    }
+
+    if (execution_plan.path == ZipCreateExecutionPath::ChunkedCpu)
+    {
+        if (chunk_scheduler == nullptr || !chunk_scheduler->Handles(entry))
+        {
+            return MakeError(
+                ZipStatus::InvalidJob,
+                "deflate entry is missing from chunk scheduler");
+        }
+        return chunk_scheduler->WriteEntry(output, entry);
     }
 
     std::unique_ptr<storage::IRandomAccessReader> opened_reader;
@@ -444,24 +455,6 @@ ZipOperationResult StreamEntryData(std::ostream& output,
         {
             return MakeError(ZipStatus::IoError, input.ErrorMessage());
         }
-        return result;
-    }
-
-    auto sample_result = MaybePreferStoreFromSample(entry);
-    if (sample_result.status != ZipStatus::Ok)
-    {
-        return sample_result;
-    }
-
-    if (execution_plan.path == ZipCreateExecutionPath::ChunkedCpu)
-    {
-        auto result = ExecuteChunkedCpuEntry(
-            output,
-            entry,
-            *reader,
-            pipeline_options,
-            execution_plan.chunk_size_bytes,
-            context);
         return result;
     }
 
@@ -606,6 +599,32 @@ ZipOperationResult CreateZipArchiveToWriter(storage::IRandomAccessWriter& writer
             .message = "zip create prepared entries",
         });
 
+    std::unique_ptr<ChunkedCpuCreateScheduler> chunk_scheduler;
+    if (encryption_mode == core::EncryptionMode::None)
+    {
+        for (auto& entry : entries)
+        {
+            if (!entry.prepared_data.empty())
+            {
+                continue;
+            }
+            auto sample_result = MaybePreferStoreFromSample(entry);
+            if (sample_result.status != ZipStatus::Ok)
+            {
+                return sample_result;
+            }
+        }
+        auto scheduler_result = CreateChunkedCpuScheduler(
+            entries,
+            pipeline_plan.options,
+            execution.memory_budget_mb,
+            context,
+            chunk_scheduler);
+        if (scheduler_result.status != ZipStatus::Ok)
+        {
+            return scheduler_result;
+        }
+    }
     std::size_t completed_entries = 0;
     for (auto& entry : entries)
     {
@@ -630,15 +649,6 @@ ZipOperationResult CreateZipArchiveToWriter(storage::IRandomAccessWriter& writer
                 return prepare_result;
             }
         }
-        else if (entry.prepared_data.empty())
-        {
-            auto sample_result = MaybePreferStoreFromSample(entry);
-            if (sample_result.status != ZipStatus::Ok)
-            {
-                return sample_result;
-            }
-        }
-
         auto write_result = WriteLocalFileHeader(output, entry);
         if (write_result.status != ZipStatus::Ok)
         {
@@ -650,7 +660,7 @@ ZipOperationResult CreateZipArchiveToWriter(storage::IRandomAccessWriter& writer
             entry,
             pipeline_plan.options,
             execution.memory_budget_mb,
-            context);
+            chunk_scheduler.get());
         if (write_result.status != ZipStatus::Ok)
         {
             return write_result;
