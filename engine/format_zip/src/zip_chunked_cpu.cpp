@@ -1,9 +1,16 @@
 #include "zip_chunked_cpu.h"
 
+#include <condition_variable>
+#include <map>
+
 namespace cozip::format_zip
 {
 namespace
 {
+#if defined(COZIP_ENABLE_TEST_HOOKS)
+std::atomic<std::size_t> g_failing_chunk_index {std::numeric_limits<std::size_t>::max()};
+#endif
+
 struct DeflateStreamLayout
 {
     std::size_t final_header_bit = 0;
@@ -743,147 +750,387 @@ bool PrepareChunkForNonFinalStream(ChunkedCompressedChunk& chunk)
 
 ZipOperationResult ExecuteChunkedCpuEntry(std::ostream& output,
                                           ZipEntrySource& entry,
+                                          storage::IRandomAccessReader& reader,
                                           const pipeline::PipelineOptions& pipeline_options,
-                                          std::size_t chunk_size)
+                                          std::size_t chunk_size,
+                                          const core::ExecutionContext& context)
 {
     ScopedZipEntryTimer timer(entry);
-    WholeFileInput input;
-    const auto load_started_at = std::chrono::steady_clock::now();
-    auto load_result = LoadWholeFileInput(
-        *entry.storage_factory,
-        entry.source_path,
-        entry.mapping_mode,
-        entry.source_reader,
-        input);
-    if (load_result.status != ZipStatus::Ok)
+    if (chunk_size == 0)
     {
-        return load_result;
+        return MakeError(ZipStatus::InvalidJob, "chunk size must be greater than zero");
     }
-    timer.AddPhase("load", std::chrono::steady_clock::now() - load_started_at);
-
-    const auto chunk_count = input.bytes.empty() ? 0 :
-        (input.bytes.size() + chunk_size - 1) / chunk_size;
-    std::vector<ChunkedCompressedChunk> chunks(chunk_count);
-    for (std::size_t index = 0; index < chunk_count; ++index)
+    if (!FitsInUint32(reader.Size()))
     {
-        chunks[index].index = index;
+        return MakeError(ZipStatus::Unsupported, "zip64 is not implemented for file: " + entry.source_label);
     }
 
-    const auto deflate_started_at = std::chrono::steady_clock::now();
-    const auto configured_workers = std::max<std::size_t>(1, pipeline_options.compressor_threads);
-    const auto worker_count = std::max<std::size_t>(
-        1,
-        std::min<std::size_t>(configured_workers, std::max<std::size_t>(chunk_count, 1)));
-    std::atomic<std::size_t> next_index = 0;
-    std::mutex error_mutex;
-    bool failed = false;
-    std::string failure_message;
-    std::vector<std::thread> workers;
-    workers.reserve(worker_count);
-
-    for (std::size_t worker = 0; worker < worker_count; ++worker)
+    enum class TerminalState
     {
-        workers.emplace_back([&] {
-            while (true)
+        Running,
+        Succeeded,
+        Failed,
+        Cancelled,
+    };
+
+    struct SharedState
+    {
+        std::mutex mutex;
+        std::condition_variable completion;
+        std::map<std::size_t, ChunkedCompressedChunk> completed_chunks;
+        TerminalState terminal = TerminalState::Running;
+        ZipOperationResult terminal_result {ZipStatus::Ok, {}};
+        std::size_t active_tasks = 0;
+        std::atomic<std::uint64_t> deflate_ns {0};
+    };
+
+    const auto shared = std::make_shared<SharedState>();
+    const auto publish_terminal = [shared](TerminalState terminal, ZipOperationResult result) {
+        std::lock_guard lock(shared->mutex);
+        if (shared->terminal == TerminalState::Running)
+        {
+            shared->terminal = terminal;
+            shared->terminal_result = std::move(result);
+        }
+        shared->completion.notify_all();
+    };
+
+    const auto complete_chunk = [shared](ChunkedCompressedChunk chunk) {
+        std::lock_guard lock(shared->mutex);
+        if (shared->terminal == TerminalState::Running)
+        {
+            shared->completed_chunks.emplace(chunk.index, std::move(chunk));
+        }
+        if (shared->active_tasks > 0)
+        {
+            --shared->active_tasks;
+        }
+        shared->completion.notify_all();
+    };
+
+    const auto fail_task = [shared, publish_terminal](std::string message) {
+        {
+            std::lock_guard lock(shared->mutex);
+            if (shared->active_tasks > 0)
             {
-                const auto index = next_index.fetch_add(1);
-                if (index >= chunk_count || failed)
-                {
-                    return;
-                }
+                --shared->active_tasks;
+            }
+        }
+        publish_terminal(
+            TerminalState::Failed,
+            MakeError(ZipStatus::IoError, std::move(message)));
+    };
 
-                const auto offset = index * chunk_size;
-                const auto size = std::min<std::size_t>(chunk_size, input.bytes.size() - offset);
-                const auto chunk_bytes = input.bytes.subspan(offset, size);
-                auto compressed =
-                    codecs::CompressDeflateBuffer(chunk_bytes, entry.compression_profile);
-                if (!compressed.success)
+    const auto profile = entry.compression_profile;
+    const auto compress_chunk = [shared, complete_chunk, fail_task, profile](
+                                    std::size_t index,
+                                    bool is_final,
+                                    std::vector<std::byte> raw) {
+        {
+            std::lock_guard lock(shared->mutex);
+            if (shared->terminal != TerminalState::Running)
+            {
+                if (shared->active_tasks > 0)
                 {
-                    std::lock_guard lock(error_mutex);
-                    failed = true;
-                    failure_message = compressed.error_message;
-                    return;
+                    --shared->active_tasks;
                 }
+                shared->completion.notify_all();
+                return;
+            }
+        }
 
-                DeflateStreamLayout layout {};
-                if (!ParseDeflateStreamLayout(compressed.bytes, layout))
+        try
+        {
+#if defined(COZIP_ENABLE_TEST_HOOKS)
+            if (g_failing_chunk_index.load(std::memory_order_relaxed) == index)
+            {
+                fail_task("injected chunk compression failure");
+                return;
+            }
+#endif
+            const auto started_at = std::chrono::steady_clock::now();
+            auto compressed = codecs::CompressDeflateBuffer(raw, profile);
+            shared->deflate_ns.fetch_add(
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started_at).count()),
+                std::memory_order_relaxed);
+            if (!compressed.success)
+            {
+                fail_task(compressed.error_message);
+                return;
+            }
+
+            ChunkedCompressedChunk result {};
+            result.index = index;
+            result.raw_size = raw.size();
+            result.compressed = std::move(compressed.bytes);
+            if (!ParseDeflateStreamLayout(result.compressed, result.layout))
+            {
+                fail_task("failed to parse deflate chunk layout");
+                return;
+            }
+            if (!is_final && !PrepareChunkForNonFinalStream(result))
+            {
+                fail_task("failed to prepare non-final chunk stream");
+                return;
+            }
+            complete_chunk(std::move(result));
+        }
+        catch (const std::exception& error)
+        {
+            fail_task(std::string("chunk compression failed: ") + error.what());
+        }
+        catch (...)
+        {
+            fail_task("chunk compression failed with an unknown exception");
+        }
+    };
+
+    auto* executor = context.environment != nullptr
+        ? context.environment->task_executor
+        : nullptr;
+    if (executor != nullptr && executor->concurrency() == 0)
+    {
+        executor = nullptr;
+    }
+    const auto submit_task = [executor, publish_terminal](core::MoveOnlyTask task) {
+        try
+        {
+            return executor->submit(std::move(task));
+        }
+        catch (const std::exception& error)
+        {
+            publish_terminal(
+                TerminalState::Failed,
+                MakeError(
+                    ZipStatus::IoError,
+                    std::string("task executor submit failed: ") + error.what()));
+        }
+        catch (...)
+        {
+            publish_terminal(
+                TerminalState::Failed,
+                MakeError(ZipStatus::IoError, "task executor submit failed"));
+        }
+        return false;
+    };
+
+    const auto file_size = reader.Size();
+    const auto chunk_count = file_size == 0
+        ? std::size_t {1}
+        : static_cast<std::size_t>(file_size / chunk_size +
+              (file_size % chunk_size != 0 ? 1u : 0u));
+    const auto max_in_flight = std::max<std::size_t>(
+        1,
+        std::min<std::size_t>(pipeline_options.max_in_flight_chunks, chunk_count));
+
+    Crc32 crc;
+    DeflateBitWriter bit_writer(output);
+    std::uint64_t next_read_offset = 0;
+    std::size_t next_submit_index = 0;
+    std::size_t next_write_index = 0;
+    std::size_t outstanding_chunks = 0;
+    std::uint64_t read_ns = 0;
+    std::uint64_t crc_ns = 0;
+    std::uint64_t write_ns = 0;
+
+    while (next_write_index < chunk_count)
+    {
+        while (next_submit_index < chunk_count && outstanding_chunks < max_in_flight)
+        {
+            if (IsCancellationRequested(context))
+            {
+                publish_terminal(TerminalState::Cancelled, MakeCancelled("zip create cancelled"));
+                break;
+            }
+
+            const auto raw_size = file_size == 0
+                ? std::size_t {0}
+                : static_cast<std::size_t>(std::min<std::uint64_t>(
+                      chunk_size, file_size - next_read_offset));
+            std::vector<std::byte> raw(raw_size);
+            std::size_t filled = 0;
+            const auto read_started_at = std::chrono::steady_clock::now();
+            while (filled < raw.size())
+            {
+                if (IsCancellationRequested(context))
                 {
-                    std::lock_guard lock(error_mutex);
-                    failed = true;
-                    failure_message = "failed to parse deflate chunk layout";
-                    return;
+                    publish_terminal(TerminalState::Cancelled, MakeCancelled("zip create cancelled"));
+                    break;
                 }
-
-                chunks[index].raw_size = size;
-                chunks[index].compressed = std::move(compressed.bytes);
-                chunks[index].layout = layout;
-                if (index + 1 < chunk_count)
+                std::size_t bytes_read = 0;
+                std::string error_message;
+                if (!reader.Read(
+                        next_read_offset + filled,
+                        std::span<std::byte>(raw).subspan(filled),
+                        bytes_read,
+                        error_message))
                 {
-                    if (!PrepareChunkForNonFinalStream(chunks[index]))
-                    {
-                        std::lock_guard lock(error_mutex);
-                        failed = true;
-                        failure_message = "failed to prepare non-final chunk stream";
-                        return;
-                    }
+                    publish_terminal(
+                        TerminalState::Failed,
+                        MakeError(ZipStatus::IoError, error_message.empty()
+                            ? "failed to read input file: " + entry.source_label
+                            : error_message));
+                    break;
+                }
+                if (bytes_read == 0)
+                {
+                    publish_terminal(
+                        TerminalState::Failed,
+                        MakeError(ZipStatus::IoError, "unexpected end of input: " + entry.source_label));
+                    break;
+                }
+                if (bytes_read > raw.size() - filled)
+                {
+                    publish_terminal(
+                        TerminalState::Failed,
+                        MakeError(ZipStatus::IoError, "reader returned more bytes than requested"));
+                    break;
+                }
+                filled += bytes_read;
+            }
+            read_ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - read_started_at).count());
+
+            {
+                std::lock_guard lock(shared->mutex);
+                if (shared->terminal != TerminalState::Running)
+                {
+                    break;
                 }
             }
-        });
-    }
 
-    for (auto& worker : workers)
-    {
-        if (worker.joinable())
-        {
-            worker.join();
+            const auto crc_started_at = std::chrono::steady_clock::now();
+            if (!raw.empty())
+            {
+                crc.Update(raw.data(), raw.size());
+            }
+            crc_ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - crc_started_at).count());
+
+            const auto index = next_submit_index;
+            const auto is_final = index + 1 == chunk_count;
+            ++next_submit_index;
+            ++outstanding_chunks;
+            next_read_offset += raw.size();
+            {
+                std::lock_guard lock(shared->mutex);
+                ++shared->active_tasks;
+            }
+
+            if (executor == nullptr)
+            {
+                compress_chunk(index, is_final, std::move(raw));
+            }
+            else if (!submit_task(core::MoveOnlyTask(
+                         [compress_chunk, index, is_final, raw = std::move(raw)]() mutable {
+                             compress_chunk(index, is_final, std::move(raw));
+                         })))
+            {
+                {
+                    std::lock_guard lock(shared->mutex);
+                    if (shared->active_tasks > 0)
+                    {
+                        --shared->active_tasks;
+                    }
+                }
+                publish_terminal(
+                    TerminalState::Failed,
+                    MakeError(ZipStatus::IoError, "task executor rejected compression chunk"));
+                break;
+            }
         }
-    }
 
-    if (failed)
-    {
-        return MakeError(ZipStatus::IoError, failure_message);
-    }
-    timer.AddPhase("deflate", std::chrono::steady_clock::now() - deflate_started_at);
+        std::unique_lock lock(shared->mutex);
+        while (shared->terminal == TerminalState::Running &&
+               !shared->completed_chunks.contains(next_write_index))
+        {
+            shared->completion.wait(lock);
+            if (IsCancellationRequested(context))
+            {
+                lock.unlock();
+                publish_terminal(TerminalState::Cancelled, MakeCancelled("zip create cancelled"));
+                lock.lock();
+            }
+        }
 
-    const auto crc_started_at = std::chrono::steady_clock::now();
-    Crc32 crc;
-    if (!input.bytes.empty())
-    {
-        crc.Update(input.bytes.data(), input.bytes.size());
-    }
-    entry.crc32 = crc.Finalize();
-    timer.AddPhase("crc", std::chrono::steady_clock::now() - crc_started_at);
+        if (shared->terminal != TerminalState::Running)
+        {
+            shared->completion.wait(lock, [&shared] { return shared->active_tasks == 0; });
+            const auto result = shared->terminal_result;
+            lock.unlock();
+            return result;
+        }
 
-    const auto write_started_at = std::chrono::steady_clock::now();
-    DeflateBitWriter bit_writer(output);
-    for (std::size_t index = 0; index < chunks.size(); ++index)
-    {
-        const auto is_final = index + 1 == chunks.size();
-        const auto ok = is_final
+        auto completed_node = shared->completed_chunks.extract(next_write_index);
+        lock.unlock();
+        auto completed = std::move(completed_node.mapped());
+
+        const auto write_started_at = std::chrono::steady_clock::now();
+        const auto is_final = next_write_index + 1 == chunk_count;
+        const auto write_ok = is_final
             ? WriteChunkBitsWithFinalOverride(
-                  bit_writer,
-                  chunks[index].compressed,
-                  chunks[index].layout,
-                  1u)
+                  bit_writer, completed.compressed, completed.layout, 1u)
             : bit_writer.WriteBitsFromSlice(
-                  chunks[index].compressed,
-                  0,
-                  chunks[index].layout.end_bit);
-        if (!ok)
+                  completed.compressed, 0, completed.layout.end_bit);
+        write_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - write_started_at).count());
+        if (!write_ok)
         {
-            return MakeError(ZipStatus::IoError, "failed to assemble chunked deflate stream");
+            publish_terminal(
+                TerminalState::Failed,
+                MakeError(ZipStatus::IoError, "failed to assemble chunked deflate stream"));
+            std::unique_lock terminal_lock(shared->mutex);
+            shared->completion.wait(
+                terminal_lock,
+                [&shared] { return shared->active_tasks == 0; });
+            return shared->terminal_result;
         }
+        ++next_write_index;
+        --outstanding_chunks;
     }
+
     if (!bit_writer.Finish())
     {
-        return MakeError(ZipStatus::IoError, "failed to flush assembled deflate stream");
+        publish_terminal(
+            TerminalState::Failed,
+            MakeError(ZipStatus::IoError, "failed to flush assembled deflate stream"));
+        return shared->terminal_result;
     }
-    timer.AddPhase("write", std::chrono::steady_clock::now() - write_started_at);
+    if (!FitsInUint32(bit_writer.TotalBytesWritten()))
+    {
+        publish_terminal(
+            TerminalState::Failed,
+            MakeError(ZipStatus::Unsupported, "compressed entry requires zip64: " + entry.source_label));
+        return shared->terminal_result;
+    }
 
-    entry.size = static_cast<std::uint32_t>(input.bytes.size());
+    publish_terminal(TerminalState::Succeeded, {ZipStatus::Ok, {}});
+    entry.crc32 = crc.Finalize();
+    entry.size = static_cast<std::uint32_t>(file_size);
     entry.compressed_size = static_cast<std::uint32_t>(bit_writer.TotalBytesWritten());
     entry.general_purpose_flag = kDataDescriptorFlag;
+    timer.AddPhase("read", std::chrono::nanoseconds(read_ns));
+    timer.AddPhase("crc", std::chrono::nanoseconds(crc_ns));
+    timer.AddPhase("deflate", std::chrono::nanoseconds(
+        shared->deflate_ns.load(std::memory_order_relaxed)));
+    timer.AddPhase("write", std::chrono::nanoseconds(write_ns));
     timer.Finish();
     return {ZipStatus::Ok, {}};
 }
+
+#if defined(COZIP_ENABLE_TEST_HOOKS)
+void SetChunkCompressionFailureForTesting(std::size_t chunk_index) noexcept
+{
+    g_failing_chunk_index.store(chunk_index, std::memory_order_relaxed);
+}
+
+void ClearChunkCompressionFailureForTesting() noexcept
+{
+    g_failing_chunk_index.store(std::numeric_limits<std::size_t>::max(), std::memory_order_relaxed);
+}
+#endif
 }

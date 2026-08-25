@@ -31,6 +31,7 @@ struct ExecutionOptions
     std::size_t worker_count = 0;
     std::size_t chunk_size_bytes = 1024 * 1024;
     std::size_t memory_budget_mb = 2048;
+    std::size_t max_in_flight_chunks = 0;
     MappingMode mapping_mode = MappingMode::Auto;
     bool allow_parallel_read = true;
     bool allow_parallel_write = true;

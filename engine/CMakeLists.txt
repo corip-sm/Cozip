@@ -71,3 +71,7 @@ target_include_directories(cozip_engine
         ${CMAKE_CURRENT_SOURCE_DIR}/format_zip/include)
 
 target_compile_features(cozip_engine PUBLIC cxx_std_20)
+
+if(COZIP_BUILD_TESTS)
+    target_compile_definitions(cozip_engine PRIVATE COZIP_ENABLE_TEST_HOOKS)
+endif()

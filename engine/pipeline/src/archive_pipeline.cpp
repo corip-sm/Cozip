@@ -1,6 +1,7 @@
 #include "cozip/pipeline/archive_pipeline.h"
 
 #include <algorithm>
+#include <limits>
 #include <sstream>
 #include <thread>
 
@@ -24,16 +25,34 @@ PipelinePlan BuildPipelinePlan(const core::ArchiveJob& job)
         plan.options.chunk_size_bytes = execution.chunk_size_bytes;
     }
 
-    const auto chunk_budget_bytes = execution.memory_budget_mb * 1024ull * 1024ull;
+    constexpr std::size_t kBytesPerMegabyte = 1024u * 1024u;
+    const auto chunk_budget_bytes = execution.memory_budget_mb >
+            std::numeric_limits<std::size_t>::max() / kBytesPerMegabyte
+        ? std::numeric_limits<std::size_t>::max()
+        : execution.memory_budget_mb * kBytesPerMegabyte;
     if (chunk_budget_bytes > 0)
     {
-        const auto max_chunks = chunk_budget_bytes / plan.options.chunk_size_bytes;
+        const auto per_chunk_bytes = plan.options.chunk_size_bytes >
+                std::numeric_limits<std::size_t>::max() / 2
+            ? std::numeric_limits<std::size_t>::max()
+            : plan.options.chunk_size_bytes * 2;
+        const auto max_chunks = chunk_budget_bytes / per_chunk_bytes;
         if (max_chunks > 0)
         {
             plan.options.max_in_flight_chunks = std::max<std::size_t>(
-                4,
+                1,
                 std::min<std::size_t>(128, static_cast<std::size_t>(max_chunks)));
         }
+        else
+        {
+            plan.options.max_in_flight_chunks = 1;
+        }
+    }
+
+    if (execution.max_in_flight_chunks > 0)
+    {
+        plan.options.max_in_flight_chunks =
+            std::clamp<std::size_t>(execution.max_in_flight_chunks, 1, 128);
     }
 
     std::ostringstream stream;

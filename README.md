@@ -110,6 +110,59 @@ job.execution.mapping_mode = cozip::core::MappingMode::Auto;
 const auto result = cozip::format_zip::Execute(job);
 ```
 
+### External compression executor
+
+Deflate compression can use a caller-owned executor without giving worker tasks access to
+storage. Set `ExecutionEnvironment::task_executor` on an `ArchiveExecutionRequest` and keep
+the environment and executor alive for the duration of `Execute()`:
+
+```cpp
+class MyExecutor final : public cozip::core::ITaskExecutor
+{
+public:
+    std::size_t concurrency() const noexcept override
+    {
+        return pool_.WorkerCount();
+    }
+
+    bool submit(cozip::core::MoveOnlyTask task) override
+    {
+        return pool_.TrySubmit([task = std::move(task)]() mutable { task(); });
+    }
+
+private:
+    ApplicationThreadPool pool_;
+};
+
+MyExecutor executor;
+cozip::core::ExecutionEnvironment environment {};
+environment.task_executor = &executor;
+
+auto request = cozip::core::MakeArchiveExecutionRequest(job);
+request.context.environment = &environment;
+request.archive.execution.max_in_flight_chunks = 8; // 0 selects the budget-derived default
+const auto result = cozip::format_zip::Execute(request);
+```
+
+`submit()` returns `true` only when the executor has accepted the task and guarantees that it
+will invoke it exactly once. It may run the task inline. A rejection or exception fails the ZIP
+operation. Cozip reads input, updates CRC, assembles the deflate stream, and writes ZIP bytes only
+on the thread calling `Execute()`; submitted tasks receive only owned memory chunks and perform
+CPU compression.
+
+The bounded reorder window holds at most `max_in_flight_chunks` chunks. Its primary payload bound
+is approximately:
+
+```text
+max_in_flight_chunks * (raw_chunk_bytes + deflate_bound(raw_chunk_bytes) + chunk metadata)
+```
+
+`ITaskExecutor` and `ExecutionEnvironment::task_executor` are additive APIs. Existing callers do
+not need to change: without an executor, the same chunk pipeline runs serially on the caller
+thread. The older `ExecutionEnvironment::thread_pool` field remains source-compatible but is not
+used for ZIP compression; adapters should migrate to `task_executor`. Because
+`ExecutionEnvironment` gained a data member, binary clients must be rebuilt against this version.
+
 암호 ZIP 생성:
 
 ```cpp
