@@ -12,6 +12,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <span>
 #include <string>
 #include <thread>
@@ -52,10 +53,14 @@ struct RecordingProgressSink final : cozip::core::IProgressSink
         if (event.phase == cozip::core::ProgressPhase::WritingOutput)
         {
             completed_paths.push_back(event.current_path);
+            completed_bytes.push_back(event.completed_bytes);
+            total_bytes.push_back(event.total_bytes);
         }
     }
 
     std::vector<std::string> completed_paths;
+    std::vector<std::uint64_t> completed_bytes;
+    std::vector<std::uint64_t> total_bytes;
 };
 
 struct OutputState
@@ -710,6 +715,11 @@ int RunMultiEntryCase(std::size_t workers,
         "entry1.bin",
         "entry2.bin",
     };
+    const std::uint64_t total_input_bytes = std::accumulate(
+        sizes.begin(), sizes.end(), std::uint64_t{0});
+    const std::vector<std::uint64_t> expected_completed_bytes {
+        sizes[0], sizes[0] + sizes[1], total_input_bytes,
+    };
 
     if (Expect(result.status == cozip::format_zip::ZipStatus::Ok,
                "multi-entry archive create should succeed") != EXIT_SUCCESS ||
@@ -723,6 +733,13 @@ int RunMultiEntryCase(std::size_t workers,
                "actual raw plus compressed payload must fit reserved admission") != EXIT_SUCCESS ||
         Expect(progress.completed_paths == expected_progress,
                "progress must report each completed entry once in archive order") != EXIT_SUCCESS ||
+        Expect(progress.completed_bytes == expected_completed_bytes,
+               "create byte progress must be cumulative") != EXIT_SUCCESS ||
+        Expect(std::ranges::all_of(progress.total_bytes,
+                   [total_input_bytes](const auto total) {
+                       return total == total_input_bytes;
+                   }),
+               "create progress must report the total input byte count") != EXIT_SUCCESS ||
         Expect(ValidateArchiveContents(output->bytes, payloads),
                "out-of-order multi-entry archive must extract byte-for-byte") != EXIT_SUCCESS ||
         Expect(executor.Accepted() == executor.Executions(),

@@ -1,6 +1,8 @@
 #include "zip_archive_internal.h"
 #include "zip_chunked_cpu.h"
 
+#include <numeric>
+
 namespace cozip::format_zip
 {
 namespace
@@ -619,7 +621,14 @@ ZipOperationResult CreateZipArchiveToWriter(storage::IRandomAccessWriter& writer
             return scheduler_result;
         }
     }
+    const auto total_input_bytes = std::accumulate(
+        entries.begin(), entries.end(), std::uint64_t{0},
+        [](const std::uint64_t total, const ZipEntrySource& entry)
+        {
+            return total + entry.size;
+        });
     std::size_t completed_entries = 0;
+    std::uint64_t completed_input_bytes = 0;
     for (auto& entry : entries)
     {
         if (IsCancellationRequested(context))
@@ -672,13 +681,15 @@ ZipOperationResult CreateZipArchiveToWriter(storage::IRandomAccessWriter& writer
         }
 
         ++completed_entries;
+        completed_input_bytes += entry.size;
         ReportProgress(
             context,
             {
                 .phase = core::ProgressPhase::WritingOutput,
                 .completed_items = completed_entries,
                 .total_items = entries.size(),
-                .completed_bytes = entry.size,
+                .completed_bytes = completed_input_bytes,
+                .total_bytes = total_input_bytes,
                 .current_path = entry.archive_path,
                 .message = "zip create wrote entry",
             });
