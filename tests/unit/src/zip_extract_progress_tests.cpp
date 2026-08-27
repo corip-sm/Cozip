@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -6,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -107,8 +109,9 @@ public:
     TrackingReader(const fs::path& path,
                    cozip::core::MappingMode mode,
                    std::atomic<std::size_t>& maximum_read,
+                   std::size_t partial_read_limit,
                    std::string& error)
-        : source_(mode), maximum_read_(maximum_read)
+        : source_(mode), maximum_read_(maximum_read), partial_read_limit_(partial_read_limit)
     {
         ready_ = source_.Open(path, error);
     }
@@ -127,7 +130,8 @@ public:
         while (observed < output.size() &&
                !maximum_read_.compare_exchange_weak(
                    observed, output.size(), std::memory_order_relaxed)) {}
-        return source_.Read(offset, output, bytes_read, error);
+        const auto count = std::min(output.size(), partial_read_limit_);
+        return source_.Read(offset, output.first(count), bytes_read, error);
     }
     bool TryMapWindow(std::uint64_t,
                       std::size_t,
@@ -139,6 +143,7 @@ public:
 private:
     cozip::platform::FilesystemRandomAccessReader source_;
     std::atomic<std::size_t>& maximum_read_;
+    std::size_t partial_read_limit_;
     bool ready_{};
 };
 
@@ -150,7 +155,8 @@ public:
         cozip::core::MappingMode mode,
         std::string& error) override
     {
-        auto reader = std::make_unique<TrackingReader>(path, mode, maximum_read, error);
+        auto reader = std::make_unique<TrackingReader>(
+            path, mode, maximum_read, partial_read_limit, error);
         return reader->Ready() ? std::move(reader) : nullptr;
     }
     [[nodiscard]] std::unique_ptr<cozip::storage::IRandomAccessWriter> OpenWriter(
@@ -161,7 +167,31 @@ public:
         return writer->Open(path, error) ? std::move(writer) : nullptr;
     }
     std::atomic<std::size_t> maximum_read{};
+    std::size_t partial_read_limit = std::numeric_limits<std::size_t>::max();
 };
+
+bool FilesEqual(const fs::path& left_path, const fs::path& right_path)
+{
+    if (fs::file_size(left_path) != fs::file_size(right_path))
+    {
+        return false;
+    }
+    std::ifstream left(left_path, std::ios::binary);
+    std::ifstream right(right_path, std::ios::binary);
+    std::array<char, 64U * 1024U> left_buffer{};
+    std::array<char, 64U * 1024U> right_buffer{};
+    while (left && right)
+    {
+        left.read(left_buffer.data(), static_cast<std::streamsize>(left_buffer.size()));
+        right.read(right_buffer.data(), static_cast<std::streamsize>(right_buffer.size()));
+        if (left.gcount() != right.gcount() ||
+            !std::equal(left_buffer.begin(), left_buffer.begin() + left.gcount(), right_buffer.begin()))
+        {
+            return false;
+        }
+    }
+    return left.eof() && right.eof();
+}
 
 void WritePatternFile(const fs::path& path, std::size_t size)
 {
@@ -296,8 +326,8 @@ int RunProgressCase(const fs::path& root,
         ValidateProgress(progress, size, 1) != EXIT_SUCCESS ||
         Expect(!expect_intermediate || has_intermediate,
                "small Deflate extraction should publish real intermediate bytes") != EXIT_SUCCESS ||
-        Expect(fs::file_size(output / input.filename()) == size,
-               "extracted output size should match source") != EXIT_SUCCESS)
+        Expect(FilesEqual(input, output / input.filename()),
+               "extracted output should match source byte-for-byte") != EXIT_SUCCESS)
     {
         return EXIT_FAILURE;
     }
@@ -346,6 +376,7 @@ int main()
     }
 
     TrackingStorageFactory tracking_factory;
+    tracking_factory.partial_read_limit = 4093U;
     const auto bounded_result = ExtractArchive(
         root / "small-deflate.zip",
         root / "bounded-out",
@@ -357,7 +388,11 @@ int main()
     if (Expect(bounded_result.status == cozip::format_zip::ZipStatus::Ok,
                "incremental extraction through a tracked reader should succeed") != EXIT_SUCCESS ||
         Expect(tracking_factory.maximum_read.load(std::memory_order_relaxed) <= 1024u * 1024u,
-               "incremental extraction must keep every archive read bounded") != EXIT_SUCCESS)
+               "incremental extraction must keep every archive read bounded") != EXIT_SUCCESS ||
+        Expect(FilesEqual(
+                   root / "small-deflate.bin",
+                   root / "bounded-out" / "small-deflate.bin"),
+               "partial-read incremental extraction should preserve every byte") != EXIT_SUCCESS)
     {
         return fail(EXIT_FAILURE);
     }
@@ -382,7 +417,9 @@ int main()
         root / "cancel-out",
         cozip::core::MappingMode::ForceOff,
         &cancel_progress,
-        &cancel);
+        &cancel,
+        nullptr,
+        true);
     if (Expect(cancel_result.status == cozip::format_zip::ZipStatus::Cancelled,
                "progress-triggered cancellation should wake extraction wait") != EXIT_SUCCESS)
     {
@@ -396,7 +433,8 @@ int main()
         cozip::core::MappingMode::ForceOff,
         nullptr,
         nullptr,
-        &failing_factory);
+        &failing_factory,
+        true);
     if (Expect(failure_result.status == cozip::format_zip::ZipStatus::IoError,
                "writer failure should wake extraction wait") != EXIT_SUCCESS)
     {

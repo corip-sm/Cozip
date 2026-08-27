@@ -13,15 +13,26 @@ ZipOperationResult ReadExactRange(
     {
         return MakeError(ZipStatus::IoError, "read range is outside archive");
     }
-    std::size_t bytes_read{};
-    std::string error;
-    if (!reader.Read(offset, destination, bytes_read, error))
+    std::size_t completed{};
+    while (completed < destination.size())
     {
-        return MakeError(ZipStatus::IoError, error);
+        std::size_t bytes_read{};
+        std::string error;
+        if (!reader.Read(
+                offset + completed,
+                destination.subspan(completed),
+                bytes_read,
+                error))
+        {
+            return MakeError(ZipStatus::IoError, error);
+        }
+        if (bytes_read == 0 || bytes_read > destination.size() - completed)
+        {
+            return MakeError(ZipStatus::IoError, "short read while loading archive range");
+        }
+        completed += bytes_read;
     }
-    return bytes_read == destination.size()
-        ? ZipOperationResult{ZipStatus::Ok, {}}
-        : MakeError(ZipStatus::IoError, "short read while loading archive range");
+    return {ZipStatus::Ok, {}};
 }
 }
 

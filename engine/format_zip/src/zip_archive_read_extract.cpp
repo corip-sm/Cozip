@@ -123,8 +123,12 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
         std::atomic<bool> failed = false;
         ZipOperationResult failure {ZipStatus::Ok, {}};
         std::vector<std::thread> workers;
-        const auto target_worker_count =
+        const auto resolved_worker_count =
             ResolveZipParallelWorkerCount(job, execution, entries, file_indexes, file_indexes.size(), total_file_bytes);
+        const auto target_worker_count = execution.incremental_extract &&
+                !archive.reader->Capabilities().supports_parallel_reads
+            ? std::size_t{1}
+            : resolved_worker_count;
         const auto initial_worker_count =
             ResolveZipInitialWorkerCount(target_worker_count, file_indexes.size(), total_file_bytes);
         workers.reserve(target_worker_count);
