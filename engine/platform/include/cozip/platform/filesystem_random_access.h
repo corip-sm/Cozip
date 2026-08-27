@@ -44,7 +44,7 @@ private:
     core::MappingMode mapping_mode_ = core::MappingMode::Auto;
     std::uint64_t size_ = 0;
     mutable std::mutex stream_mutex_;
-    std::ifstream stream_;
+    std::fstream stream_;
     MappedFileReader mapped_reader_;
     MappedView mapped_view_ {};
 };

@@ -1643,7 +1643,11 @@ std::size_t ResolveZipParallelWorkerCount(const core::ArchiveJob& job,
         return max_workers;
     }
 
-    constexpr std::uint64_t kBytesPerWorker = 192ull * 1024ull * 1024ull;
+    // Incremental extraction keeps only bounded input/output chunks resident.
+    // Large archives therefore benefit from CPU parallelism well below the old
+    // 192 MiB-per-worker threshold, especially when one logical file is stored
+    // as independent ZIP entries.
+    constexpr std::uint64_t kBytesPerWorker = 64ull * 1024ull * 1024ull;
     constexpr std::uint64_t kMinPerWorkerMemoryBytes = 48ull * 1024ull * 1024ull;
     constexpr std::uint64_t kWorkerScratchMultiplier = 3ull;
     std::size_t parallelism_score = 0;
@@ -1713,15 +1717,6 @@ std::size_t ResolveZipParallelWorkerCount(const core::ArchiveJob& job,
         ? 100ull
         : (total_uncompressed_bytes * 100ull) / total_compressed_bytes;
     auto io_workers = max_workers;
-    if (average_expansion_x100 >= 240ull)
-    {
-        io_workers = std::max<std::size_t>(1, max_workers / 2);
-    }
-    else if (average_expansion_x100 >= 170ull)
-    {
-        io_workers = std::max<std::size_t>(1, (max_workers * 2) / 3);
-    }
-
     if (mapped_entries == work_item_count && total_uncompressed_bytes <= (2ull * 1024ull * 1024ull * 1024ull))
     {
         io_workers = std::min<std::size_t>(io_workers, 4);

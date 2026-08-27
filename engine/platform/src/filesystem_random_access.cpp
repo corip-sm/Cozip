@@ -30,7 +30,15 @@ bool FilesystemRandomAccessReader::Open(const std::filesystem::path& path, std::
         return false;
     }
 
-    stream_.open(path, std::ios::binary);
+#if defined(__EMSCRIPTEN__)
+    // WasmFS OPFS maps read-only descriptors to Blob reads. Every Blob read
+    // allocates an ArrayBuffer and copies it into Wasm memory. OPFS files are
+    // writable application-owned storage, so request read/write access to use
+    // FileSystemSyncAccessHandle and read directly into the Wasm buffer.
+    stream_.open(path, std::ios::binary | std::ios::in | std::ios::out);
+#else
+    stream_.open(path, std::ios::binary | std::ios::in);
+#endif
     if (!stream_)
     {
         error_message = "failed to open file for random read: " + PathToString(path);
@@ -294,13 +302,12 @@ bool FilesystemRandomAccessWriter::Resize(std::uint64_t size, std::string& error
         return false;
     }
 
+    std::lock_guard lock(stream_mutex_);
+    stream_.flush();
+    if (!stream_)
     {
-        std::lock_guard lock(stream_mutex_);
-        if (stream_.is_open())
-        {
-            stream_.flush();
-            stream_.close();
-        }
+        error_message = "failed to flush output file before resize: " + PathToString(path_);
+        return false;
     }
 
     std::error_code resize_error;
@@ -311,9 +318,17 @@ bool FilesystemRandomAccessWriter::Resize(std::uint64_t size, std::string& error
         return false;
     }
 
+    stream_.clear();
+    stream_.seekp(0, std::ios::beg);
+    if (!stream_)
+    {
+        error_message = "failed to seek output file after resize: " + PathToString(path_);
+        return false;
+    }
+
     size_ = size;
     current_offset_ = 0;
-    return ReopenStream(error_message);
+    return true;
 }
 
 bool FilesystemRandomAccessWriter::Flush(std::string& error_message)
