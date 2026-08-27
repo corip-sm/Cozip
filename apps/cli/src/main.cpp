@@ -25,8 +25,8 @@ void PrintUsage()
     std::cout << "Usage:\n";
     std::cout << "  cozip_cli version\n";
     std::cout << "  cozip_cli help\n";
-    std::cout << "  cozip_cli create [--store|--deflate|--fast|--balanced|--small|--max] [--threads N] [--memory-mb N] [--chunk-kb N] [--password VALUE] <output.zip> <input...>\n";
-    std::cout << "  cozip_cli extract [--password VALUE] <archive.zip> [output-dir]\n";
+    std::cout << "  cozip_cli create [--store|--deflate|--fast|--balanced|--small|--max] [--threads N] [--memory-mb N] [--chunk-kb N] [--parallel-read|--no-parallel-read] [--password VALUE] <output.zip> <input...>\n";
+    std::cout << "  cozip_cli extract [--threads N] [--parallel-read|--no-parallel-read] [--password VALUE] <archive.zip> [output-dir]\n";
     std::cout << "  cozip_cli list <archive.zip>\n";
     std::cout << "  cozip_cli test [--password VALUE] <archive.zip>\n";
 }
@@ -44,6 +44,7 @@ cozip::core::ArchiveJob MakeZipJob(
     case cozip::core::JobType::CreateArchive:
     {
         job.profile = cozip::core::CompressionProfile::Fast;
+        job.execution.allow_parallel_read = true;
         std::size_t start_index = 0;
         while (start_index < args.size())
         {
@@ -99,6 +100,16 @@ cozip::core::ArchiveJob MakeZipJob(
                 job.execution.encryption.password = args[start_index + 1];
                 start_index += 2;
             }
+            else if (current_arg == "--parallel-read")
+            {
+                job.execution.allow_parallel_read = true;
+                ++start_index;
+            }
+            else if (current_arg == "--no-parallel-read")
+            {
+                job.execution.allow_parallel_read = false;
+                ++start_index;
+            }
             else
             {
                 break;
@@ -116,29 +127,94 @@ cozip::core::ArchiveJob MakeZipJob(
         break;
     }
     case cozip::core::JobType::ExtractArchive:
+        job.execution.allow_parallel_read = true;
         if (args.size() >= 2 && std::string_view {args[0]} == "--password")
         {
             job.execution.encryption.mode = cozip::core::EncryptionMode::ZipTraditional;
             job.execution.encryption.password = args[1];
-            if (args.size() >= 3)
+            std::size_t start_index = 2;
+            while (start_index < args.size())
             {
-                job.inputs.push_back({args[2], false});
+                const std::string_view current_arg {args[start_index]};
+                if (current_arg == "--threads" && start_index + 1 < args.size())
+                {
+                    job.execution.worker_count = static_cast<std::size_t>(std::stoull(args[start_index + 1]));
+                    start_index += 2;
+                }
+                else if (current_arg == "--parallel-read")
+                {
+                    job.execution.allow_parallel_read = true;
+                    ++start_index;
+                }
+                else if (current_arg == "--no-parallel-read")
+                {
+                    job.execution.allow_parallel_read = false;
+                    ++start_index;
+                }
+                else if (current_arg == "--password" && start_index + 1 < args.size())
+                {
+                    job.execution.encryption.password = args[start_index + 1];
+                    start_index += 2;
+                }
+                else
+                {
+                    break;
+                }
             }
-            if (args.size() >= 4)
+            if (args.size() > start_index)
             {
-                job.output_path = args[3];
+                job.inputs.push_back({args[start_index], false});
+            }
+            if (args.size() > start_index + 1)
+            {
+                job.output_path = args[start_index + 1];
             }
             break;
         }
 
-        if (!args.empty())
+        if (args.empty())
         {
-            job.inputs.push_back({args[0], false});
+            break;
         }
 
-        if (args.size() >= 2)
+        std::size_t start_index = 0;
+        while (start_index < args.size())
         {
-            job.output_path = args[1];
+            const std::string_view current_arg {args[start_index]};
+            if (current_arg == "--threads" && start_index + 1 < args.size())
+            {
+                job.execution.worker_count = static_cast<std::size_t>(std::stoull(args[start_index + 1]));
+                start_index += 2;
+            }
+            else if (current_arg == "--parallel-read")
+            {
+                job.execution.allow_parallel_read = true;
+                ++start_index;
+            }
+            else if (current_arg == "--no-parallel-read")
+            {
+                job.execution.allow_parallel_read = false;
+                ++start_index;
+            }
+            else if (current_arg == "--password" && start_index + 1 < args.size())
+            {
+                job.execution.encryption.mode = cozip::core::EncryptionMode::ZipTraditional;
+                job.execution.encryption.password = args[start_index + 1];
+                start_index += 2;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (start_index < args.size())
+        {
+            job.inputs.push_back({args[start_index], false});
+        }
+        if (args.size() > start_index + 1)
+        {
+            job.output_path = args[start_index + 1];
         }
         break;
     case cozip::core::JobType::ListArchive:

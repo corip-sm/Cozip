@@ -126,7 +126,7 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
         const auto resolved_worker_count =
             ResolveZipParallelWorkerCount(job, execution, entries, file_indexes, file_indexes.size(), total_file_bytes);
         const auto target_worker_count = execution.incremental_extract &&
-                !archive.reader->Capabilities().supports_parallel_reads
+                !(execution.allow_parallel_read && archive.reader->Capabilities().supports_parallel_reads)
             ? std::size_t{1}
             : resolved_worker_count;
         const auto initial_worker_count =

@@ -79,7 +79,7 @@ storage::StorageCapabilities FilesystemRandomAccessReader::Capabilities() const 
     storage::StorageCapabilities capabilities {};
     capabilities.supports_random_read = true;
     capabilities.supports_mapping = MappingAllowed();
-    capabilities.supports_parallel_reads = false;
+    capabilities.supports_parallel_reads = true;
     capabilities.preferred_window_bytes = 8u * 1024u * 1024u;
     capabilities.preferred_alignment_bytes = capabilities.supports_mapping ? 64u * 1024u : 0u;
     capabilities.max_efficient_read_bytes = 8u * 1024u * 1024u;
