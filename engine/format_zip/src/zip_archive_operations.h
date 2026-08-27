@@ -2,6 +2,8 @@
 
 #include "zip_archive_streams.h"
 
+#include <functional>
+
 namespace cozip::format_zip
 {
 std::string NormalizeArchivePath(const fs::path& path);

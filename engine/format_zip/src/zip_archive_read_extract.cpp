@@ -1,6 +1,7 @@
 #include "zip_archive_internal.h"
 
 #include <condition_variable>
+#include <deque>
 
 namespace cozip::format_zip
 {
@@ -99,10 +100,11 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
     {
         std::atomic<std::size_t> next_index = 0;
         std::atomic<std::size_t> completed_count = 0;
-        std::atomic<std::uint64_t> completed_bytes = 0;
         std::mutex error_mutex;
         std::mutex completion_mutex;
         std::condition_variable completion_changed;
+        std::uint64_t completion_generation = 0;
+        std::deque<std::uint64_t> pending_written_bytes;
         std::atomic<bool> failed = false;
         ZipOperationResult failure {ZipStatus::Ok, {}};
         std::vector<std::thread> workers;
@@ -111,6 +113,13 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
         const auto initial_worker_count =
             ResolveZipInitialWorkerCount(target_worker_count, file_indexes.size(), total_file_bytes);
         workers.reserve(target_worker_count);
+        auto signal_completion = [&] {
+            {
+                std::lock_guard lock(completion_mutex);
+                ++completion_generation;
+            }
+            completion_changed.notify_one();
+        };
         auto spawn_worker = [&] {
             workers.emplace_back([&] {
                 while (true)
@@ -127,7 +136,7 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
                         {
                             failure = MakeCancelled("zip extract cancelled");
                         }
-                        completion_changed.notify_one();
+                        signal_completion();
                         return;
                     }
 
@@ -136,9 +145,22 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
                     {
                         return;
                     }
+                    signal_completion();
 
                     const auto& entry = entries[file_indexes[position]];
                     const auto destination_path = output_root / fs::path(entry.name);
+                    std::function<void(std::uint64_t)> byte_progress;
+                    if (context.progress != nullptr)
+                    {
+                        byte_progress = [&](std::uint64_t bytes) {
+                            {
+                                std::lock_guard lock(completion_mutex);
+                                pending_written_bytes.push_back(bytes);
+                                ++completion_generation;
+                            }
+                            completion_changed.notify_one();
+                        };
+                    }
                     const auto write_result =
                         WriteExtractedFile(
                             archive.bytes,
@@ -146,11 +168,7 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
                             destination_path,
                             ResolveStorageFactory(context),
                             execution,
-                            [&](const std::uint64_t bytes) {
-                                completed_bytes.fetch_add(
-                                    bytes, std::memory_order_relaxed);
-                                completion_changed.notify_one();
-                            });
+                            byte_progress);
                     if (write_result.status != ZipStatus::Ok)
                     {
                         std::lock_guard lock(error_mutex);
@@ -158,12 +176,12 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
                         {
                             failure = write_result;
                         }
-                        completion_changed.notify_one();
+                        signal_completion();
                         return;
                     }
 
                     completed_count.fetch_add(1, std::memory_order_relaxed);
-                    completion_changed.notify_one();
+                    signal_completion();
                 }
             });
         };
@@ -181,36 +199,65 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
 
         std::size_t published_completed = 0;
         std::uint64_t published_bytes = 0;
-        while (!failed.load(std::memory_order_relaxed))
+        std::uint64_t observed_generation = 0;
+        while (true)
         {
+            std::deque<std::uint64_t> written_events;
+            {
+                std::lock_guard lock(completion_mutex);
+                written_events.swap(pending_written_bytes);
+                observed_generation = completion_generation;
+            }
             const auto assigned = next_index.load(std::memory_order_relaxed);
             const auto completed = completed_count.load(std::memory_order_relaxed);
-            const auto written_bytes = completed_bytes.load(std::memory_order_relaxed);
             const auto remaining = file_indexes.size() > completed ? file_indexes.size() - completed : 0;
             const auto in_flight = assigned > completed ? assigned - completed : 0;
-            if (completed != published_completed || written_bytes != published_bytes)
+            if (!written_events.empty())
+            {
+                for (const auto bytes : written_events)
+                {
+                    published_bytes += bytes;
+                    ReportProgress(
+                        context,
+                        {
+                            .phase = core::ProgressPhase::WritingOutput,
+                            .completed_items = completed,
+                            .total_items = file_indexes.size(),
+                            .completed_bytes = published_bytes,
+                            .total_bytes = total_file_bytes,
+                            .current_path = archive_path.generic_string(),
+                            .message = "zip extract running",
+                        });
+                }
+                published_completed = completed;
+            }
+            else if (completed != published_completed)
             {
                 published_completed = completed;
-                published_bytes = written_bytes;
                 ReportProgress(
                     context,
                     {
                         .phase = core::ProgressPhase::WritingOutput,
                         .completed_items = completed,
                         .total_items = file_indexes.size(),
-                        .completed_bytes = written_bytes,
+                        .completed_bytes = published_bytes,
                         .total_bytes = total_file_bytes,
                         .current_path = archive_path.generic_string(),
                         .message = "zip extract running",
                     });
             }
-            if (remaining == 0)
+            if (failed.load(std::memory_order_relaxed) || remaining == 0)
             {
-                break;
+                std::lock_guard lock(completion_mutex);
+                if (pending_written_bytes.empty())
+                {
+                    break;
+                }
+                continue;
             }
 
-            if (workers.size() < target_worker_count
-                && in_flight >= workers.size() && remaining > workers.size())
+            if (workers.size() < target_worker_count &&
+                in_flight >= workers.size() && remaining > workers.size())
             {
                 spawn_worker();
                 continue;
@@ -218,9 +265,8 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
 
             std::unique_lock lock(completion_mutex);
             completion_changed.wait(lock, [&] {
-                return failed.load(std::memory_order_relaxed)
-                    || completed_count.load(std::memory_order_relaxed) != completed
-                    || completed_bytes.load(std::memory_order_relaxed) != written_bytes;
+                return failed.load(std::memory_order_relaxed) ||
+                    completion_generation != observed_generation;
             });
         }
 

@@ -24,6 +24,15 @@ target_compile_definitions(cozip_zip_executor_tests
 
 add_test(NAME cozip_zip_executor_tests COMMAND cozip_zip_executor_tests)
 
+add_executable(cozip_zip_extract_progress_tests
+    unit/src/zip_extract_progress_tests.cpp)
+
+target_link_libraries(cozip_zip_extract_progress_tests
+    PRIVATE
+        cozip_engine)
+
+add_test(NAME cozip_zip_extract_progress_tests COMMAND cozip_zip_extract_progress_tests)
+
 add_executable(cozip_zip_multi_entry_benchmark
     unit/src/zip_multi_entry_benchmark.cpp)
 

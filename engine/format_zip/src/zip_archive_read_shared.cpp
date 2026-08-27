@@ -518,11 +518,16 @@ ZipOperationResult DecompressEntryData(std::span<const std::byte> bytes,
             ZipMethodName(entry.compression_method) + " entry=" + entry.name);
 }
 
-bool ShouldUseStreamingDeflateExtract(const ZipCentralDirectoryEntry& entry) noexcept
+bool CanUseStreamingDeflateExtract(const ZipCentralDirectoryEntry& entry) noexcept
 {
     return entry.compression_method == static_cast<std::uint16_t>(codecs::ZipMethod::Deflate) &&
-           entry.uncompressed_size >= (64ull * 1024ull * 1024ull) &&
            entry.compressed_size <= static_cast<std::uint64_t>(std::numeric_limits<mz_uint>::max());
+}
+
+bool ShouldUseStreamingDeflateExtract(const ZipCentralDirectoryEntry& entry) noexcept
+{
+    return CanUseStreamingDeflateExtract(entry) &&
+        entry.uncompressed_size >= (64ull * 1024ull * 1024ull);
 }
 
 std::uint64_t ResolveMappedLibdeflateExtractLimitBytes(std::size_t memory_budget_mb) noexcept
@@ -1192,6 +1197,12 @@ ZipOperationResult WriteExtractedFile(std::span<const std::byte> bytes,
 
     if (entry.compression_method == static_cast<std::uint16_t>(codecs::ZipMethod::Deflate))
     {
+        if (!IsZipEntryEncrypted(entry) && progress &&
+            CanUseStreamingDeflateExtract(entry))
+        {
+            return StreamDeflateEntryToFile(bytes, entry, destination_path, progress);
+        }
+
         if (!IsZipEntryEncrypted(entry) &&
             execution.mapping_mode != core::MappingMode::ForceOff &&
             ShouldUseMappedLibdeflateExtract(entry, execution.memory_budget_mb))
