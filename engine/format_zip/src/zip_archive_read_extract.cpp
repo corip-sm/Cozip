@@ -10,18 +10,33 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
     const auto execution = core::ResolveExecutionOptions(job);
     const fs::path archive_path = Utf8Path(job.inputs.front().path);
     ArchiveInput archive;
-    auto load_result = LoadArchiveInput(
-        archive_path,
-        ResolveStorageFactory(context),
-        execution.mapping_mode,
-        archive);
-    if (load_result.status != ZipStatus::Ok)
+    if (execution.incremental_extract)
     {
-        return load_result;
+        std::string open_error;
+        if (!OpenRandomAccessReader(
+                ResolveStorageFactory(context), archive_path,
+                execution.mapping_mode, archive.reader, open_error))
+        {
+            return MakeError(ZipStatus::IoError, open_error);
+        }
+    }
+    else
+    {
+        auto load_result = LoadArchiveInput(
+            archive_path,
+            ResolveStorageFactory(context),
+            execution.mapping_mode,
+            archive);
+        if (load_result.status != ZipStatus::Ok)
+        {
+            return load_result;
+        }
     }
 
     std::vector<ZipCentralDirectoryEntry> entries;
-    auto parse_result = ParseCentralDirectory(archive.bytes, entries);
+    auto parse_result = execution.incremental_extract
+        ? ParseCentralDirectory(*archive.reader, entries)
+        : ParseCentralDirectory(archive.bytes, entries);
     if (parse_result.status != ZipStatus::Ok)
     {
         return parse_result;
@@ -161,14 +176,13 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
                             completion_changed.notify_one();
                         };
                     }
-                    const auto write_result =
-                        WriteExtractedFile(
-                            archive.bytes,
-                            entry,
-                            destination_path,
-                            ResolveStorageFactory(context),
-                            execution,
-                            byte_progress);
+                    const auto write_result = execution.incremental_extract
+                        ? WriteExtractedFile(
+                            *archive.reader, entry, destination_path,
+                            ResolveStorageFactory(context), execution, byte_progress)
+                        : WriteExtractedFile(
+                            archive.bytes, entry, destination_path,
+                            ResolveStorageFactory(context), execution, byte_progress);
                     if (write_result.status != ZipStatus::Ok)
                     {
                         std::lock_guard lock(error_mutex);

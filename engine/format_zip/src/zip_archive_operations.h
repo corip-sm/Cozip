@@ -49,7 +49,6 @@ std::size_t ResolveZipStreamChunkSize(const ZipEntrySource& entry, const pipelin
 ZipOperationResult WriteLocalFileHeader(std::ostream& output, const ZipEntrySource& entry);
 ZipOperationResult WriteDataDescriptor(std::ostream& output, const ZipEntrySource& entry);
 ZipOperationResult StreamStoreEntry(std::istream& input, std::ostream& output, std::vector<std::byte>& buffer, ZipEntrySource& entry);
-ZipOperationResult ReadAllBytes(storage::IRandomAccessReader& reader, std::uint64_t offset, std::span<std::byte> destination);
 ZipOperationResult LoadFileBytes(storage::IStorageFactory& storage_factory, const fs::path& path, std::vector<std::byte>& bytes);
 ZipOperationResult ReadAllBytes(storage::IRandomAccessReader& reader, std::uint64_t offset, std::vector<std::byte>& bytes);
 ZipOperationResult LoadWholeFileInput(storage::IStorageFactory& storage_factory, const fs::path& path, core::MappingMode mapping_mode, storage::IRandomAccessReader* existing_reader, WholeFileInput& input);
@@ -57,6 +56,7 @@ ZipOperationResult LoadFileSample(storage::IStorageFactory& storage_factory, con
 ZipOperationResult CreateZipArchive(const core::ArchiveJob& job, const core::ArchiveRequest* archive_request, const core::ExecutionContext& context);
 ZipOperationResult LoadArchiveInput(const fs::path& archive_path, storage::IStorageFactory& storage_factory, core::MappingMode mapping_mode, ArchiveInput& input);
 ZipOperationResult ParseCentralDirectory(std::span<const std::byte> bytes, std::vector<ZipCentralDirectoryEntry>& entries);
+ZipOperationResult ParseCentralDirectory(storage::IRandomAccessReader& reader, std::vector<ZipCentralDirectoryEntry>& entries);
 ZipOperationResult ListArchive(const core::ArchiveJob& job, const core::ExecutionContext& context);
 core::EncryptionMode ResolveZipEncryptionMode(const core::ExecutionOptions& execution) noexcept;
 bool IsZipEntryEncrypted(const ZipCentralDirectoryEntry& entry) noexcept;
@@ -67,6 +67,7 @@ bool HasPathTraversal(std::string_view path);
 ZipOperationResult ResolveExtractionRoot(const core::ArchiveJob& job, fs::path& output_root);
 bool ZipExtractTraceEnabled() noexcept;
 ZipOperationResult WriteExtractedFile(std::span<const std::byte> bytes, const ZipCentralDirectoryEntry& entry, const fs::path& destination_path, storage::IStorageFactory& storage_factory, const core::ExecutionOptions& execution, const std::function<void(std::uint64_t)>& progress = {});
+ZipOperationResult WriteExtractedFile(storage::IRandomAccessReader& reader, const ZipCentralDirectoryEntry& entry, const fs::path& destination_path, storage::IStorageFactory& storage_factory, const core::ExecutionOptions& execution, const std::function<void(std::uint64_t)>& progress = {});
 ZipOperationResult ValidateEntryData(std::span<const std::byte> bytes, const ZipCentralDirectoryEntry& entry, const core::ExecutionOptions& execution);
 std::size_t ResolveZipParallelWorkerCount(const core::ArchiveJob& job, const core::ExecutionOptions& execution, const std::vector<ZipCentralDirectoryEntry>& entries, const std::vector<std::size_t>& file_indexes, std::size_t work_item_count, std::uint64_t total_uncompressed_bytes) noexcept;
 std::size_t ResolveZipInitialWorkerCount(std::size_t target_worker_count, std::size_t work_item_count, std::uint64_t total_uncompressed_bytes) noexcept;

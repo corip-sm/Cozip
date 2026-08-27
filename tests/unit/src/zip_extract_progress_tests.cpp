@@ -101,6 +101,68 @@ public:
     }
 };
 
+class TrackingReader final : public cozip::storage::IRandomAccessReader
+{
+public:
+    TrackingReader(const fs::path& path,
+                   cozip::core::MappingMode mode,
+                   std::atomic<std::size_t>& maximum_read,
+                   std::string& error)
+        : source_(mode), maximum_read_(maximum_read)
+    {
+        ready_ = source_.Open(path, error);
+    }
+    [[nodiscard]] bool Ready() const noexcept { return ready_; }
+    [[nodiscard]] std::uint64_t Size() const noexcept override { return source_.Size(); }
+    [[nodiscard]] cozip::storage::StorageCapabilities Capabilities() const noexcept override
+    {
+        return source_.Capabilities();
+    }
+    bool Read(std::uint64_t offset,
+              std::span<std::byte> output,
+              std::size_t& bytes_read,
+              std::string& error) override
+    {
+        auto observed = maximum_read_.load(std::memory_order_relaxed);
+        while (observed < output.size() &&
+               !maximum_read_.compare_exchange_weak(
+                   observed, output.size(), std::memory_order_relaxed)) {}
+        return source_.Read(offset, output, bytes_read, error);
+    }
+    bool TryMapWindow(std::uint64_t,
+                      std::size_t,
+                      cozip::storage::MappedReadWindow&,
+                      std::string&) override
+    {
+        return false;
+    }
+private:
+    cozip::platform::FilesystemRandomAccessReader source_;
+    std::atomic<std::size_t>& maximum_read_;
+    bool ready_{};
+};
+
+class TrackingStorageFactory final : public cozip::storage::IStorageFactory
+{
+public:
+    [[nodiscard]] std::unique_ptr<cozip::storage::IRandomAccessReader> OpenReader(
+        const fs::path& path,
+        cozip::core::MappingMode mode,
+        std::string& error) override
+    {
+        auto reader = std::make_unique<TrackingReader>(path, mode, maximum_read, error);
+        return reader->Ready() ? std::move(reader) : nullptr;
+    }
+    [[nodiscard]] std::unique_ptr<cozip::storage::IRandomAccessWriter> OpenWriter(
+        const fs::path& path,
+        std::string& error) override
+    {
+        auto writer = std::make_unique<cozip::platform::FilesystemRandomAccessWriter>();
+        return writer->Open(path, error) ? std::move(writer) : nullptr;
+    }
+    std::atomic<std::size_t> maximum_read{};
+};
+
 void WritePatternFile(const fs::path& path, std::size_t size)
 {
     std::vector<char> block(1024u * 1024u);
@@ -145,7 +207,8 @@ cozip::format_zip::ZipOperationResult ExtractArchive(
     cozip::core::MappingMode mapping_mode,
     ProgressSink* progress,
     cozip::core::ICancelToken* cancel = nullptr,
-    cozip::storage::IStorageFactory* storage_factory = nullptr)
+    cozip::storage::IStorageFactory* storage_factory = nullptr,
+    bool incremental = false)
 {
     cozip::core::ArchiveExecutionRequest request {};
     request.archive.operation = cozip::core::Operation::Extract;
@@ -154,6 +217,8 @@ cozip::format_zip::ZipOperationResult ExtractArchive(
     request.archive.execution.worker_count = 1;
     request.archive.execution.memory_budget_mb = 256;
     request.archive.execution.mapping_mode = mapping_mode;
+    request.archive.execution.incremental_extract = incremental;
+    request.archive.execution.chunk_size_bytes = 1024u * 1024u;
     request.archive.inputs.push_back({
         .kind = cozip::core::ArchiveSourceKind::Path,
         .path = archive.string(),
@@ -204,7 +269,8 @@ int RunProgressCase(const fs::path& root,
                     std::size_t size,
                     cozip::core::CompressionProfile profile,
                     cozip::core::MappingMode mapping_mode,
-                    bool expect_intermediate)
+                    bool expect_intermediate,
+                    bool incremental = false)
 {
     const auto input = root / (std::string(name) + ".bin");
     const auto archive = root / (std::string(name) + ".zip");
@@ -218,7 +284,7 @@ int RunProgressCase(const fs::path& root,
     }
     ProgressSink progress;
     const auto extract_result = ExtractArchive(
-        archive, output, mapping_mode, &progress);
+        archive, output, mapping_mode, &progress, nullptr, nullptr, incremental);
     const auto has_intermediate = std::any_of(
         progress.events.begin(),
         progress.events.end(),
@@ -257,11 +323,13 @@ int main()
             root, "store", 1u * 1024u * 1024u,
             cozip::core::CompressionProfile::Store,
             cozip::core::MappingMode::ForceOff,
-            false) != EXIT_SUCCESS ||
+            false,
+            true) != EXIT_SUCCESS ||
         RunProgressCase(
             root, "small-deflate", 2u * 1024u * 1024u,
             cozip::core::CompressionProfile::Fast,
             cozip::core::MappingMode::ForceOff,
+            true,
             true) != EXIT_SUCCESS ||
         RunProgressCase(
             root, "mapped", 32u * 1024u * 1024u,
@@ -273,6 +341,23 @@ int main()
             cozip::core::CompressionProfile::Fast,
             cozip::core::MappingMode::ForceOff,
             true) != EXIT_SUCCESS)
+    {
+        return fail(EXIT_FAILURE);
+    }
+
+    TrackingStorageFactory tracking_factory;
+    const auto bounded_result = ExtractArchive(
+        root / "small-deflate.zip",
+        root / "bounded-out",
+        cozip::core::MappingMode::ForceOff,
+        nullptr,
+        nullptr,
+        &tracking_factory,
+        true);
+    if (Expect(bounded_result.status == cozip::format_zip::ZipStatus::Ok,
+               "incremental extraction through a tracked reader should succeed") != EXIT_SUCCESS ||
+        Expect(tracking_factory.maximum_read.load(std::memory_order_relaxed) <= 1024u * 1024u,
+               "incremental extraction must keep every archive read bounded") != EXIT_SUCCESS)
     {
         return fail(EXIT_FAILURE);
     }

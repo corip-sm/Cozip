@@ -33,6 +33,7 @@ struct ExecutionOptions
     std::size_t memory_budget_mb = 2048;
     std::size_t max_in_flight_chunks = 0;
     MappingMode mapping_mode = MappingMode::Auto;
+    bool incremental_extract = false;
     bool allow_parallel_read = true;
     bool allow_parallel_write = true;
     EncryptionOptions encryption {};

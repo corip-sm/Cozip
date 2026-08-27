@@ -2,6 +2,29 @@
 
 namespace cozip::format_zip
 {
+namespace
+{
+ZipOperationResult ReadExactRange(
+    storage::IRandomAccessReader& reader,
+    const std::uint64_t offset,
+    const std::span<std::byte> destination)
+{
+    if (offset > reader.Size() || destination.size() > reader.Size() - offset)
+    {
+        return MakeError(ZipStatus::IoError, "read range is outside archive");
+    }
+    std::size_t bytes_read{};
+    std::string error;
+    if (!reader.Read(offset, destination, bytes_read, error))
+    {
+        return MakeError(ZipStatus::IoError, error);
+    }
+    return bytes_read == destination.size()
+        ? ZipOperationResult{ZipStatus::Ok, {}}
+        : MakeError(ZipStatus::IoError, "short read while loading archive range");
+}
+}
+
 ZipOperationResult LoadArchiveInput(const fs::path& archive_path,
                                     storage::IStorageFactory& storage_factory,
                                     core::MappingMode mapping_mode,
@@ -256,6 +279,81 @@ ZipOperationResult ParseCentralDirectory(std::span<const std::byte> bytes,
     }
 
     return {ZipStatus::Ok, {}};
+}
+
+ZipOperationResult ParseCentralDirectory(
+    storage::IRandomAccessReader& reader,
+    std::vector<ZipCentralDirectoryEntry>& entries)
+{
+    constexpr std::uint64_t minimum_eocd_size = 22;
+    constexpr std::uint64_t maximum_eocd_comment = 65535;
+    const auto archive_size = reader.Size();
+    if (archive_size < minimum_eocd_size)
+    {
+        return MakeError(ZipStatus::InvalidJob, "archive is too small to be a valid zip file");
+    }
+
+    const auto tail_size = static_cast<std::size_t>(std::min<std::uint64_t>(
+        archive_size, minimum_eocd_size + maximum_eocd_comment));
+    const auto tail_offset = archive_size - tail_size;
+    std::vector<std::byte> tail(tail_size);
+    auto tail_read = ReadExactRange(reader, tail_offset, std::span<std::byte>(tail));
+    if (tail_read.status != ZipStatus::Ok)
+    {
+        return tail_read;
+    }
+
+    std::size_t eocd_offset = tail.size();
+    for (std::size_t offset = tail.size() - minimum_eocd_size + 1; offset-- > 0;)
+    {
+        if (ReadU32(tail, offset) == kEndOfCentralDirectorySignature)
+        {
+            eocd_offset = offset;
+            break;
+        }
+    }
+    if (eocd_offset == tail.size())
+    {
+        return MakeError(ZipStatus::InvalidJob, "end of central directory record not found");
+    }
+
+    const auto entry_count = ReadU16(tail, eocd_offset + 10);
+    const auto directory_size = ReadU32(tail, eocd_offset + 12);
+    const auto directory_offset = ReadU32(tail, eocd_offset + 16);
+    if (entry_count == kZip64Sentinel16 || directory_size == kZip64Sentinel32 ||
+        directory_offset == kZip64Sentinel32)
+    {
+        return MakeError(ZipStatus::Unsupported,
+                         "incremental extraction does not support zip64 archives");
+    }
+    if (static_cast<std::uint64_t>(directory_offset) + directory_size > archive_size)
+    {
+        return MakeError(ZipStatus::InvalidJob, "central directory points outside the archive");
+    }
+
+    std::vector<std::byte> compact_directory(
+        static_cast<std::size_t>(directory_size) + minimum_eocd_size);
+    auto directory_read = ReadExactRange(
+        reader, directory_offset,
+        std::span<std::byte>(compact_directory).first(directory_size));
+    if (directory_read.status != ZipStatus::Ok)
+    {
+        return directory_read;
+    }
+    std::copy_n(tail.data() + eocd_offset, minimum_eocd_size,
+                compact_directory.data() + directory_size);
+    auto* synthetic_eocd = compact_directory.data() + directory_size;
+    synthetic_eocd[12] = static_cast<std::byte>(directory_size & 0xffU);
+    synthetic_eocd[13] = static_cast<std::byte>((directory_size >> 8U) & 0xffU);
+    synthetic_eocd[14] = static_cast<std::byte>((directory_size >> 16U) & 0xffU);
+    synthetic_eocd[15] = static_cast<std::byte>((directory_size >> 24U) & 0xffU);
+    synthetic_eocd[16] = std::byte{};
+    synthetic_eocd[17] = std::byte{};
+    synthetic_eocd[18] = std::byte{};
+    synthetic_eocd[19] = std::byte{};
+    synthetic_eocd[20] = std::byte{};
+    synthetic_eocd[21] = std::byte{};
+    return ParseCentralDirectory(compact_directory, entries);
 }
 
 ZipOperationResult ListArchive(const core::ArchiveJob& job, const core::ExecutionContext& context)
@@ -1277,6 +1375,176 @@ ZipOperationResult WriteExtractedFile(std::span<const std::byte> bytes,
         progress(entry.uncompressed_size);
     }
     return write_result;
+}
+
+ZipOperationResult WriteExtractedFile(
+    storage::IRandomAccessReader& reader,
+    const ZipCentralDirectoryEntry& entry,
+    const fs::path& destination_path,
+    storage::IStorageFactory& storage_factory,
+    const core::ExecutionOptions& execution,
+    const std::function<void(std::uint64_t)>& progress)
+{
+    if (IsZipEntryEncrypted(entry))
+    {
+        return MakeError(ZipStatus::Unsupported,
+                         "incremental extraction does not support encrypted entries: " + entry.name);
+    }
+    if (entry.compression_method != static_cast<std::uint16_t>(codecs::ZipMethod::Store) &&
+        entry.compression_method != static_cast<std::uint16_t>(codecs::ZipMethod::Deflate))
+    {
+        return MakeError(ZipStatus::Unsupported,
+                         "incremental extraction method is not supported: " + entry.name);
+    }
+
+    constexpr std::size_t local_header_size = 30U;
+    std::array<std::byte, local_header_size> local_header{};
+    auto header_read = ReadExactRange(
+        reader, entry.local_header_offset, std::span<std::byte>(local_header));
+    if (header_read.status != ZipStatus::Ok)
+    {
+        return header_read;
+    }
+    if (ReadU32(local_header, 0U) != kLocalFileHeaderSignature ||
+        ReadU16(local_header, 8U) != entry.compression_method)
+    {
+        return MakeError(ZipStatus::InvalidJob, "invalid incremental extraction local header");
+    }
+    const auto data_offset = entry.local_header_offset + local_header_size +
+        ReadU16(local_header, 26U) + ReadU16(local_header, 28U);
+    if (data_offset > reader.Size() || entry.compressed_size > reader.Size() - data_offset)
+    {
+        return MakeError(ZipStatus::InvalidJob, "incremental extraction data exceeds archive size");
+    }
+
+    std::unique_ptr<storage::IRandomAccessWriter> writer;
+    std::string storage_error;
+    if (!OpenRandomAccessWriter(storage_factory, destination_path, writer, storage_error))
+    {
+        return MakeError(ZipStatus::IoError, storage_error);
+    }
+    if (!writer->Resize(entry.uncompressed_size, storage_error))
+    {
+        return MakeError(ZipStatus::IoError, storage_error);
+    }
+
+    const auto chunk_bytes = std::clamp<std::size_t>(
+        execution.chunk_size_bytes, 64U * 1024U, 8U * 1024U * 1024U);
+    std::vector<std::byte> input_buffer(chunk_bytes);
+    Crc32 crc;
+    std::uint64_t input_offset{};
+    std::uint64_t output_offset{};
+
+    if (entry.compression_method == static_cast<std::uint16_t>(codecs::ZipMethod::Store))
+    {
+        while (input_offset < entry.compressed_size)
+        {
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+                input_buffer.size(), entry.compressed_size - input_offset));
+            auto read = ReadExactRange(
+                reader, data_offset + input_offset,
+                std::span<std::byte>(input_buffer).first(count));
+            if (read.status != ZipStatus::Ok)
+            {
+                return read;
+            }
+            const auto chunk = std::span<const std::byte>(input_buffer).first(count);
+            crc.Update(chunk.data(), chunk.size());
+            if (!writer->Write(output_offset, chunk, storage_error))
+            {
+                return MakeError(ZipStatus::IoError, storage_error);
+            }
+            input_offset += count;
+            output_offset += count;
+            if (progress) progress(count);
+        }
+    }
+    else
+    {
+        std::vector<unsigned char> output_buffer(chunk_bytes);
+        mz_stream stream{};
+        if (mz_inflateInit2(&stream, -MZ_DEFAULT_WINDOW_BITS) != MZ_OK)
+        {
+            return MakeError(ZipStatus::IoError, "failed to initialize incremental inflate decompressor");
+        }
+        const auto fail_inflate = [&](const ZipStatus status, std::string message) {
+            mz_inflateEnd(&stream);
+            return MakeError(status, std::move(message));
+        };
+        bool finished{};
+        while (!finished)
+        {
+            if (stream.avail_in == 0U && input_offset < entry.compressed_size)
+            {
+                const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+                    input_buffer.size(), entry.compressed_size - input_offset));
+                auto read = ReadExactRange(
+                    reader, data_offset + input_offset,
+                    std::span<std::byte>(input_buffer).first(count));
+                if (read.status != ZipStatus::Ok)
+                {
+                    mz_inflateEnd(&stream);
+                    return read;
+                }
+                input_offset += count;
+                stream.next_in = reinterpret_cast<unsigned char*>(input_buffer.data());
+                stream.avail_in = static_cast<mz_uint>(count);
+            }
+            stream.next_out = output_buffer.data();
+            stream.avail_out = static_cast<mz_uint>(output_buffer.size());
+            const auto status = mz_inflate(&stream, MZ_NO_FLUSH);
+            const auto produced = output_buffer.size() - stream.avail_out;
+            if (produced > 0U)
+            {
+                const auto chunk = std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(output_buffer.data()), produced);
+                crc.Update(chunk.data(), chunk.size());
+                if (!writer->Write(output_offset, chunk, storage_error))
+                {
+                    return fail_inflate(ZipStatus::IoError, storage_error);
+                }
+                output_offset += produced;
+                if (progress) progress(produced);
+            }
+            if (status == MZ_STREAM_END)
+            {
+                finished = true;
+            }
+            else if (status != MZ_OK && !(status == MZ_BUF_ERROR && produced > 0U))
+            {
+                return fail_inflate(
+                    ZipStatus::InvalidJob,
+                    "incremental deflate decompression failed: " + entry.name);
+            }
+            else if (stream.avail_in == 0U && input_offset == entry.compressed_size && produced == 0U)
+            {
+                return fail_inflate(
+                    ZipStatus::InvalidJob,
+                    "incremental deflate stream ended prematurely: " + entry.name);
+            }
+        }
+        if (input_offset - stream.avail_in != entry.compressed_size)
+        {
+            return fail_inflate(
+                ZipStatus::InvalidJob,
+                "incremental deflate stream did not consume the entry: " + entry.name);
+        }
+        if (mz_inflateEnd(&stream) != MZ_OK)
+        {
+            return MakeError(ZipStatus::IoError, "failed to finalize incremental inflate decompressor");
+        }
+    }
+
+    if (output_offset != entry.uncompressed_size || crc.Finalize() != entry.crc32)
+    {
+        return MakeError(ZipStatus::InvalidJob,
+                         "incremental extraction size or crc mismatch: " + entry.name);
+    }
+    if (!writer->Flush(storage_error))
+    {
+        return MakeError(ZipStatus::IoError, storage_error);
+    }
+    return {ZipStatus::Ok, {}};
 }
 
 ZipOperationResult ValidateEntryData(std::span<const std::byte> bytes,
