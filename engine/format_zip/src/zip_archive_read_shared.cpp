@@ -918,7 +918,8 @@ ZipOperationResult WriteBufferToFile(storage::IStorageFactory& storage_factory,
 
 ZipOperationResult StreamDeflateEntryToFile(std::span<const std::byte> bytes,
                                             const ZipCentralDirectoryEntry& entry,
-                                            const fs::path& destination_path)
+                                            const fs::path& destination_path,
+                                            const std::function<void(std::uint64_t)>& progress)
 {
     const auto started_at = std::chrono::steady_clock::now();
 
@@ -1033,6 +1034,10 @@ ZipOperationResult StreamDeflateEntryToFile(std::span<const std::byte> bytes,
                     .count());
 #endif
             total_output += produced;
+            if (progress)
+            {
+                progress(produced);
+            }
         }
 
         if (inflate_status == MZ_STREAM_END)
@@ -1155,7 +1160,8 @@ ZipOperationResult WriteExtractedFile(std::span<const std::byte> bytes,
                                       const ZipCentralDirectoryEntry& entry,
                                       const fs::path& destination_path,
                                       storage::IStorageFactory& storage_factory,
-                                      const core::ExecutionOptions& execution)
+                                      const core::ExecutionOptions& execution,
+                                      const std::function<void(std::uint64_t)>& progress)
 {
     if (entry.compression_method == static_cast<std::uint16_t>(codecs::ZipMethod::Store) &&
         !IsZipEntryEncrypted(entry))
@@ -1177,6 +1183,10 @@ ZipOperationResult WriteExtractedFile(std::span<const std::byte> bytes,
         {
             return write_result;
         }
+        if (progress)
+        {
+            progress(entry.uncompressed_size);
+        }
         return {ZipStatus::Ok, {}};
     }
 
@@ -1186,12 +1196,17 @@ ZipOperationResult WriteExtractedFile(std::span<const std::byte> bytes,
             execution.mapping_mode != core::MappingMode::ForceOff &&
             ShouldUseMappedLibdeflateExtract(entry, execution.memory_budget_mb))
         {
-            return ExtractDeflateEntryToMappedFile(bytes, entry, destination_path);
+            auto result = ExtractDeflateEntryToMappedFile(bytes, entry, destination_path);
+            if (result.status == ZipStatus::Ok && progress)
+            {
+                progress(entry.uncompressed_size);
+            }
+            return result;
         }
 
         if (!IsZipEntryEncrypted(entry) && ShouldUseStreamingDeflateExtract(entry))
         {
-            return StreamDeflateEntryToFile(bytes, entry, destination_path);
+            return StreamDeflateEntryToFile(bytes, entry, destination_path, progress);
         }
 
         const auto started_at = std::chrono::steady_clock::now();
@@ -1218,6 +1233,11 @@ ZipOperationResult WriteExtractedFile(std::span<const std::byte> bytes,
             return write_result;
         }
 
+        if (progress)
+        {
+            progress(entry.uncompressed_size);
+        }
+
         TraceZipExtractEntry(entry, "buffered", std::chrono::steady_clock::now() - started_at);
         return {ZipStatus::Ok, {}};
     }
@@ -1239,7 +1259,13 @@ ZipOperationResult WriteExtractedFile(std::span<const std::byte> bytes,
         return MakeError(ZipStatus::InvalidJob, "crc mismatch while extracting: " + entry.name);
     }
 
-    return WriteBufferToFile(storage_factory, destination_path, uncompressed_bytes);
+    auto write_result = WriteBufferToFile(
+        storage_factory, destination_path, uncompressed_bytes);
+    if (write_result.status == ZipStatus::Ok && progress)
+    {
+        progress(entry.uncompressed_size);
+    }
+    return write_result;
 }
 
 ZipOperationResult ValidateEntryData(std::span<const std::byte> bytes,

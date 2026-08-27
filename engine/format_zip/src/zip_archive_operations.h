@@ -64,7 +64,7 @@ ZipOperationResult DecryptZipEntryPayload(std::span<const std::byte> encrypted_b
 bool HasPathTraversal(std::string_view path);
 ZipOperationResult ResolveExtractionRoot(const core::ArchiveJob& job, fs::path& output_root);
 bool ZipExtractTraceEnabled() noexcept;
-ZipOperationResult WriteExtractedFile(std::span<const std::byte> bytes, const ZipCentralDirectoryEntry& entry, const fs::path& destination_path, storage::IStorageFactory& storage_factory, const core::ExecutionOptions& execution);
+ZipOperationResult WriteExtractedFile(std::span<const std::byte> bytes, const ZipCentralDirectoryEntry& entry, const fs::path& destination_path, storage::IStorageFactory& storage_factory, const core::ExecutionOptions& execution, const std::function<void(std::uint64_t)>& progress = {});
 ZipOperationResult ValidateEntryData(std::span<const std::byte> bytes, const ZipCentralDirectoryEntry& entry, const core::ExecutionOptions& execution);
 std::size_t ResolveZipParallelWorkerCount(const core::ArchiveJob& job, const core::ExecutionOptions& execution, const std::vector<ZipCentralDirectoryEntry>& entries, const std::vector<std::size_t>& file_indexes, std::size_t work_item_count, std::uint64_t total_uncompressed_bytes) noexcept;
 std::size_t ResolveZipInitialWorkerCount(std::size_t target_worker_count, std::size_t work_item_count, std::uint64_t total_uncompressed_bytes) noexcept;

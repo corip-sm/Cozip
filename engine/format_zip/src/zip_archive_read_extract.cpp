@@ -1,5 +1,7 @@
 #include "zip_archive_internal.h"
 
+#include <condition_variable>
+
 namespace cozip::format_zip
 {
 ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::ExecutionContext& context)
@@ -97,7 +99,10 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
     {
         std::atomic<std::size_t> next_index = 0;
         std::atomic<std::size_t> completed_count = 0;
+        std::atomic<std::uint64_t> completed_bytes = 0;
         std::mutex error_mutex;
+        std::mutex completion_mutex;
+        std::condition_variable completion_changed;
         std::atomic<bool> failed = false;
         ZipOperationResult failure {ZipStatus::Ok, {}};
         std::vector<std::thread> workers;
@@ -122,6 +127,7 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
                         {
                             failure = MakeCancelled("zip extract cancelled");
                         }
+                        completion_changed.notify_one();
                         return;
                     }
 
@@ -139,7 +145,12 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
                             entry,
                             destination_path,
                             ResolveStorageFactory(context),
-                            execution);
+                            execution,
+                            [&](const std::uint64_t bytes) {
+                                completed_bytes.fetch_add(
+                                    bytes, std::memory_order_relaxed);
+                                completion_changed.notify_one();
+                            });
                     if (write_result.status != ZipStatus::Ok)
                     {
                         std::lock_guard lock(error_mutex);
@@ -147,10 +158,12 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
                         {
                             failure = write_result;
                         }
+                        completion_changed.notify_one();
                         return;
                     }
 
                     completed_count.fetch_add(1, std::memory_order_relaxed);
+                    completion_changed.notify_one();
                 }
             });
         };
@@ -166,34 +179,49 @@ ZipOperationResult ExtractArchive(const core::ArchiveJob& job, const core::Execu
                       << '\n';
         }
 
-        while (workers.size() < target_worker_count && !failed.load(std::memory_order_relaxed))
+        std::size_t published_completed = 0;
+        std::uint64_t published_bytes = 0;
+        while (!failed.load(std::memory_order_relaxed))
         {
             const auto assigned = next_index.load(std::memory_order_relaxed);
             const auto completed = completed_count.load(std::memory_order_relaxed);
+            const auto written_bytes = completed_bytes.load(std::memory_order_relaxed);
             const auto remaining = file_indexes.size() > completed ? file_indexes.size() - completed : 0;
             const auto in_flight = assigned > completed ? assigned - completed : 0;
-            ReportProgress(
-                context,
-                {
-                    .phase = core::ProgressPhase::WritingOutput,
-                    .completed_items = completed,
-                    .total_items = file_indexes.size(),
-                    .total_bytes = total_file_bytes,
-                    .current_path = archive_path.generic_string(),
-                    .message = "zip extract running",
-                });
+            if (completed != published_completed || written_bytes != published_bytes)
+            {
+                published_completed = completed;
+                published_bytes = written_bytes;
+                ReportProgress(
+                    context,
+                    {
+                        .phase = core::ProgressPhase::WritingOutput,
+                        .completed_items = completed,
+                        .total_items = file_indexes.size(),
+                        .completed_bytes = written_bytes,
+                        .total_bytes = total_file_bytes,
+                        .current_path = archive_path.generic_string(),
+                        .message = "zip extract running",
+                    });
+            }
             if (remaining == 0)
             {
                 break;
             }
 
-            if (in_flight >= workers.size() && remaining > workers.size())
+            if (workers.size() < target_worker_count
+                && in_flight >= workers.size() && remaining > workers.size())
             {
                 spawn_worker();
                 continue;
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            std::unique_lock lock(completion_mutex);
+            completion_changed.wait(lock, [&] {
+                return failed.load(std::memory_order_relaxed)
+                    || completed_count.load(std::memory_order_relaxed) != completed
+                    || completed_bytes.load(std::memory_order_relaxed) != written_bytes;
+            });
         }
 
         for (auto& worker : workers)
